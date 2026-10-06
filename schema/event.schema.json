@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceFact Runtime Event",
+  "type": "object",
+  "required": ["id", "timestamp_ms", "event_type", "process", "subject", "metadata", "source", "sensitivity"],
+  "properties": {
+    "id": {"type": "string"},
+    "timestamp_ms": {"type": "integer"},
+    "event_type": {"type": "string"},
+    "process": {
+      "type": "object",
+      "required": ["pid", "executable"],
+      "properties": {
+        "pid": {"type": "integer"},
+        "executable": {"type": "string"},
+        "command_line": {"type": ["string", "null"]},
+        "parent_pid": {"type": ["integer", "null"]}
+      }
+    },
+    "subject": {"type": "string"},
+    "target": {"type": ["string", "null"]},
+    "metadata": {},
+    "source": {"type": "string"},
+    "sensitivity": {"enum": ["PublicMetadata", "PotentiallySensitive", "Sensitive"]}
+  }
+}

@@ -1,0 +1,19 @@
+:root { font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; background: #f6f7f9; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.shell { width: min(1100px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
+header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 32px; }
+.eyebrow { font-size: 12px; letter-spacing: .14em; font-weight: 700; margin-bottom: 8px; }
+h1 { margin: 0; font-size: clamp(28px, 5vw, 48px); line-height: 1.05; max-width: 720px; }
+.status { font-size: 14px; white-space: nowrap; padding-top: 6px; }
+.summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
+.summary > div, .card { background: white; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 4px 16px rgba(17,24,39,.04); }
+.summary > div { padding: 20px; }
+.summary span, .privacy-grid span { display: block; color: #6b7280; font-size: 13px; margin-bottom: 8px; }
+.summary strong { font-size: 28px; }
+.card { padding: 24px; margin-bottom: 16px; }
+.card-title { font-weight: 700; margin-bottom: 8px; }
+.muted { color: #6b7280; margin: 0; }
+.privacy-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 16px; }
+.privacy-grid > div { padding: 16px; border: 1px solid #e5e7eb; border-radius: 12px; }
+@media (max-width: 720px) { header { flex-direction: column; } .summary, .privacy-grid { grid-template-columns: 1fr; } }

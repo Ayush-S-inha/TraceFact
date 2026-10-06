@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceFact Runtime Passport",
+  "type": "object",
+  "required": ["schema_version", "passport_id", "generated_at_ms", "application", "observations", "changes"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "passport_id": {"type": "string"},
+    "generated_at_ms": {"type": "integer"},
+    "application": {"type": "string"},
+    "observations": {
+      "type": "object",
+      "required": ["processes", "network_targets", "files", "libraries"],
+      "properties": {
+        "processes": {"type": "array", "items": {"type": "string"}},
+        "network_targets": {"type": "array", "items": {"type": "string"}},
+        "files": {"type": "array", "items": {"type": "string"}},
+        "libraries": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "changes": {"type": "array"}
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1",
+  "passport_id": "baseline-demo",
+  "generated_at_ms": 1000,
+  "application": "checkout-service",
+  "observations": {
+    "processes": ["checkout-service"],
+    "network_targets": ["postgres.internal:5432", "redis.internal:6379"],
+    "files": ["/app/config/payment.json"],
+    "libraries": ["libssl", "libpq"]
+  },
+  "changes": []
+}
