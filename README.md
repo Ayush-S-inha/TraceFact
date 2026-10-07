@@ -2,7 +2,7 @@
 
 > See what your software actually does.
 
-TraceFact watches an application while it is running and builds a local record of its behavior. It can then compare that behavior with an earlier run so a developer can see what changed and what needs a closer look.
+TraceFact watches an application while it is running and builds a local record of its behavior. The project is being built so that behavior can be compared with earlier runs and unexpected changes can be investigated.
 
 ## The idea
 
@@ -18,23 +18,43 @@ WHY IT MATTERS
 PROOF
 ```
 
-## First release
+## Current state
 
-The first version is built around a few things:
+The foundation is in place.
 
-* process and process tree observation
-* network destinations and ports
-* filesystem paths
-* runtime and library observations
-* Runtime Passports
-* comparison between a baseline and a new run
-* basic security checks backed by observed evidence
-* a local web interface and CLI
-* SQLite storage
+TraceFact currently has a Windows process collector that can inspect a selected process tree, build a Runtime Passport, and save the observation to local SQLite storage. The command line interface can list saved runs and inspect them later.
+
+The collector records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines.
+
+The next collectors and analysis features will be added as separate parts of the project.
+
+## Try it
+
+Build the project with Cargo, then give TraceFact the PID of a running Windows process.
+
+```text
+tracefact process <pid>
+tracefact history
+tracefact inspect latest
+```
+
+The process command saves the observation locally. The history command lists saved runs, and the inspect command shows the stored event data and Runtime Passport for one run.
+
+## Planned
+
+The next parts of the project are:
+
+* network observation
+* filesystem observation
+* runtime dependency observations
+* comparison between runs
+* basic security checks
+* local web interface
 * reports and passport exports
-* a small built in demo
+* deeper Linux collection
+* optional AI explanations
 
-HTTP inspection, deeper Linux eBPF collection, and optional AI come later.
+These features are not all implemented yet.
 
 ## Privacy
 
@@ -52,12 +72,6 @@ The starting targets are roughly:
 * less than 1 to 2 percent CPU during normal observation
 
 These numbers are targets. We will measure them on real workloads and adjust the implementation where needed.
-
-## Current state
-
-This repository is the foundation. It contains the data model, SQLite schema, collector interface, analysis scaffolding, demo data, and the first UI shell.
-
-The next step is the real Windows process collector.
 
 ## Project layout
 

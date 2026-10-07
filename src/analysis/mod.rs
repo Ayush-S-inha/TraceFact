@@ -9,7 +9,9 @@ pub fn passport_from_snapshot(snapshot: &RuntimeSnapshot, generated_at_ms: i64) 
 
     for event in &snapshot.events {
         match event.event_type {
-            crate::model::EventType::ProcessStart | crate::model::EventType::ProcessExit => {
+            crate::model::EventType::ProcessStart
+            | crate::model::EventType::ProcessExit
+            | crate::model::EventType::ProcessObserved => {
                 observations
                     .processes
                     .push(event.process.executable.clone());

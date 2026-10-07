@@ -21,6 +21,6 @@
     "target": {"type": ["string", "null"]},
     "metadata": {},
     "source": {"type": "string"},
-    "sensitivity": {"enum": ["PublicMetadata", "PotentiallySensitive", "Sensitive"]}
+    "sensitivity": {"enum": ["SystemMetadata", "PublicMetadata", "PotentiallySensitive", "Sensitive"]}
   }
 }

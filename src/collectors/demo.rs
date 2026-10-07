@@ -1,4 +1,4 @@
-use crate::collectors::Collector;
+use crate::collectors::{Collector, CollectorError};
 use crate::model::{
     EventType, PassportObservations, ProcessIdentity, RuntimeEvent, RuntimePassport, Sensitivity,
 };
@@ -10,7 +10,7 @@ impl Collector for DemoCollector {
         "demo"
     }
 
-    fn collect(&mut self) -> Vec<RuntimeEvent> {
+    fn collect(&mut self) -> Result<Vec<RuntimeEvent>, CollectorError> {
         let process = ProcessIdentity {
             pid: 4812,
             executable: "checkout-service".into(),
@@ -18,7 +18,7 @@ impl Collector for DemoCollector {
             parent_pid: None,
         };
 
-        vec![
+        Ok(vec![
             RuntimeEvent {
                 id: "evt-001".into(),
                 timestamp_ms: 1_000,
@@ -28,7 +28,7 @@ impl Collector for DemoCollector {
                 target: Some("checkout-service".into()),
                 metadata: serde_json::json!({}),
                 source: "demo".into(),
-                sensitivity: Sensitivity::PublicMetadata,
+                sensitivity: Sensitivity::SystemMetadata,
             },
             RuntimeEvent {
                 id: "evt-002".into(),
@@ -39,20 +39,20 @@ impl Collector for DemoCollector {
                 target: Some("api.example.com:443".into()),
                 metadata: serde_json::json!({"protocol":"tcp","port":443}),
                 source: "demo".into(),
-                sensitivity: Sensitivity::PublicMetadata,
+                sensitivity: Sensitivity::SystemMetadata,
             },
             RuntimeEvent {
                 id: "evt-003".into(),
                 timestamp_ms: 1_050,
                 event_type: EventType::FileAccess,
-                process: process,
+                process,
                 subject: "file_read".into(),
                 target: Some("/app/config/payment.json".into()),
                 metadata: serde_json::json!({}),
                 source: "demo".into(),
                 sensitivity: Sensitivity::PotentiallySensitive,
             },
-        ]
+        ])
     }
 }
 

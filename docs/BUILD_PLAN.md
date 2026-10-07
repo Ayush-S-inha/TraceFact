@@ -4,24 +4,29 @@
 
 TraceFact watches software while it runs and tells the developer what it actually did, what was unexpected, and why.
 
+## Current state
+
+The first Windows process collector is working. It can inspect a selected process tree, build a Runtime Passport, and save the observation to local SQLite storage.
+
 ## Build order
 
 1. Event schema
 2. Rust core, SQLite, and localhost API
 3. Windows process and process tree observer
-4. Network destination and port observer
-5. Filesystem observer
-6. Runtime and library observer
-7. Runtime Passport
-8. Baseline and current behavior comparison
-9. Basic security checks with evidence
-10. Local layered UI
-11. Basic policy creation and verification
-12. Exportable reports and passport files
-13. Built in demo application
-14. CPU, RAM, disk, and privacy benchmarks
-15. Self contained packaging for each platform
-16. Later work: deeper Linux eBPF support, HTTP and other protocol observers, and optional AI
+4. Local persistence for collected runs
+5. Network destination and port observer
+6. Filesystem observer
+7. Runtime and library observer
+8. Runtime Passport improvements
+9. Baseline and current behavior comparison
+10. Basic security checks with evidence
+11. Local layered UI
+12. Basic policy creation and verification
+13. Exportable reports and passport files
+14. Built in demo application
+15. CPU, RAM, disk, and privacy benchmarks
+16. Self contained packaging for each platform
+17. Later work: deeper Linux eBPF support, HTTP and other protocol observers, and optional AI
 
 ## Rules that should not change without a good reason
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum EventType {
     ProcessStart,
     ProcessExit,
+    ProcessObserved,
     NetworkConnection,
     FileAccess,
     LibraryLoaded,
@@ -14,7 +15,7 @@ pub enum EventType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Sensitivity {
-    PublicMetadata,
+    SystemMetadata,
     PotentiallySensitive,
     Sensitive,
 }
