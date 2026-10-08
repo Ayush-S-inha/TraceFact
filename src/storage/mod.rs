@@ -129,6 +129,95 @@ pub fn initialize(path: &str) -> Result<Connection, StorageError> {
     Ok(connection)
 }
 
+pub fn begin_run(
+    connection: &mut Connection,
+    snapshot: &RuntimeSnapshot,
+    passport: &RuntimePassport,
+) -> Result<(), StorageError> {
+    let transaction = connection.transaction()?;
+
+    transaction.execute(
+        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            &snapshot.snapshot_id,
+            &snapshot.application,
+            snapshot.started_at_ms,
+            snapshot.ended_at_ms,
+            &snapshot.schema_version,
+        ],
+    )?;
+
+    let passport_json = serde_json::to_string(passport)?;
+    transaction.execute(
+        "INSERT INTO passports (passport_id, run_id, generated_at_ms, passport_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &passport.passport_id,
+            &snapshot.snapshot_id,
+            passport.generated_at_ms,
+            passport_json,
+        ],
+    )?;
+
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn append_event(
+    connection: &mut Connection,
+    run_id: &str,
+    event: &RuntimeEvent,
+) -> Result<(), StorageError> {
+    let transaction = connection.transaction()?;
+    insert_event(&transaction, run_id, event)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn finish_run(
+    connection: &mut Connection,
+    run_id: &str,
+    ended_at_ms: i64,
+    passport: &RuntimePassport,
+) -> Result<(), StorageError> {
+    let transaction = connection.transaction()?;
+
+    let updated = transaction.execute(
+        "UPDATE runs SET ended_at_ms = ?1 WHERE run_id = ?2",
+        params![ended_at_ms, run_id],
+    )?;
+
+    if updated != 1 {
+        return Err(StorageError::InvalidValue(format!(
+            "run {run_id} was not found while finishing the run"
+        )));
+    }
+
+    let passport_json = serde_json::to_string(passport)?;
+    let updated = transaction.execute(
+        "UPDATE passports
+            SET generated_at_ms = ?1, passport_json = ?2
+          WHERE passport_id = ?3 AND run_id = ?4",
+        params![
+            passport.generated_at_ms,
+            passport_json,
+            &passport.passport_id,
+            run_id,
+        ],
+    )?;
+
+    if updated != 1 {
+        return Err(StorageError::InvalidValue(format!(
+            "passport {} was not found while finishing run {run_id}",
+            passport.passport_id
+        )));
+    }
+
+    transaction.commit()?;
+    Ok(())
+}
+
 pub fn save_snapshot_and_passport(
     connection: &mut Connection,
     snapshot: &RuntimeSnapshot,
@@ -427,6 +516,75 @@ mod tests {
         assert_eq!(stored.passport.passport_id, "passport-snap-inspect");
         assert_eq!(stored.events.len(), 1);
         assert_eq!(stored.events[0].event_id, "event-inspect");
+    }
+
+    #[test]
+    fn continuous_run_lifecycle_round_trip() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        let snapshot = RuntimeSnapshot {
+            schema_version: "0.1".into(),
+            snapshot_id: "watch-test".into(),
+            application: "demo.exe".into(),
+            started_at_ms: 1000,
+            ended_at_ms: None,
+            events: vec![],
+        };
+        let passport = RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: "passport-watch-test".into(),
+            generated_at_ms: 1000,
+            application: "demo.exe".into(),
+            observations: Default::default(),
+            changes: vec![],
+        };
+
+        begin_run(&mut connection, &snapshot, &passport).expect("run should begin");
+
+        let event = RuntimeEvent {
+            id: "watch-event-1".into(),
+            timestamp_ms: 1001,
+            event_type: EventType::ProcessStart,
+            process: ProcessIdentity {
+                pid: 42,
+                executable: "child.exe".into(),
+                command_line: None,
+                parent_pid: Some(10),
+            },
+            subject: "process".into(),
+            target: Some("child.exe".into()),
+            metadata: serde_json::json!({"depth": 1}),
+            source: "test".into(),
+            sensitivity: Sensitivity::SystemMetadata,
+        };
+
+        append_event(&mut connection, "watch-test", &event).expect("event should be appended");
+
+        let completed_passport = RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: "passport-watch-test".into(),
+            generated_at_ms: 2000,
+            application: "demo.exe".into(),
+            observations: crate::model::PassportObservations {
+                processes: vec!["child.exe".into()],
+                network_targets: vec![],
+                files: vec![],
+                libraries: vec![],
+            },
+            changes: vec![],
+        };
+
+        finish_run(&mut connection, "watch-test", 2000, &completed_passport)
+            .expect("run should finish");
+
+        let stored = get_run(&connection, "watch-test")
+            .expect("run should be readable")
+            .expect("run should exist");
+
+        assert_eq!(stored.ended_at_ms, Some(2000));
+        assert_eq!(stored.events.len(), 1);
+        assert_eq!(stored.events[0].event_id, "watch-event-1");
+        assert_eq!(stored.passport.generated_at_ms, 2000);
+        assert_eq!(stored.passport.observations.processes, vec!["child.exe"]);
     }
 
     #[test]

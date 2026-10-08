@@ -8,6 +8,15 @@ use std::process::ExitCode;
 
 #[cfg(windows)]
 use crate::collectors::Collector;
+#[cfg(windows)]
+use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+#[cfg(windows)]
+use std::time::Duration;
 
 fn print_help() {
     println!("TraceFact 0.1.0");
@@ -16,6 +25,7 @@ fn print_help() {
     println!("  tracefact doctor");
     println!("  tracefact demo");
     println!("  tracefact process <pid>");
+    println!("  tracefact watch <pid>");
     println!("  tracefact history");
     println!("  tracefact inspect <run_id>");
     println!("  tracefact inspect latest");
@@ -87,6 +97,231 @@ fn run_process(pid: u32) -> Result<(), String> {
         let _ = pid;
         return Err("The Windows process collector is available only on Windows.".to_string());
     }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct ActiveProcess {
+    name: String,
+    depth: u32,
+}
+
+#[cfg(windows)]
+fn run_watch(pid: u32) -> Result<(), String> {
+    use collectors::windows_process::{
+        build_process_exit_event, build_process_lifecycle_event, classify_process_depth,
+        snapshot_process_tree, wait_for_watchers, ProcessWatchEvent, WatchSource,
+        WindowsProcessEventWatcher,
+    };
+
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let run_id = format!("watch-{started_at_ms}-{pid}");
+
+    let (mut connection, database_path) =
+        storage::open_default().map_err(|error| error.to_string())?;
+    let watcher = WindowsProcessEventWatcher::start();
+    let receiver = watcher.receiver();
+
+    let queued_events =
+        wait_for_watchers(receiver, Duration::from_secs(10)).map_err(|error| error.to_string())?;
+
+    let initial_events = snapshot_process_tree(pid, &run_id).map_err(|error| error.to_string())?;
+    let root_event = initial_events
+        .iter()
+        .find(|event| event.process.pid == pid)
+        .ok_or_else(|| format!("Process with PID {pid} was not found."))?;
+    let application = root_event.process.executable.clone();
+
+    let initial_snapshot = model::RuntimeSnapshot {
+        schema_version: "0.1".to_string(),
+        snapshot_id: run_id.clone(),
+        application: application.clone(),
+        started_at_ms,
+        ended_at_ms: None,
+        events: vec![],
+    };
+    let initial_passport =
+        analysis::PassportAccumulator::default().finish(&run_id, started_at_ms, &application);
+    storage::begin_run(&mut connection, &initial_snapshot, &initial_passport)
+        .map_err(|error| error.to_string())?;
+
+    let mut active = BTreeMap::<u32, ActiveProcess>::new();
+    let mut passport = analysis::PassportAccumulator::default();
+    let mut sequence = 0_u64;
+
+    for event in initial_events {
+        active.insert(
+            event.process.pid,
+            ActiveProcess {
+                name: event.process.executable.clone(),
+                depth: event
+                    .metadata
+                    .get("depth")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+            },
+        );
+        passport.observe(&event);
+        storage::append_event(&mut connection, &run_id, &event)
+            .map_err(|error| error.to_string())?;
+        sequence = sequence.wrapping_add(1);
+    }
+
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_handler = Arc::clone(&stop_requested);
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
+
+    println!("TraceFact process watch");
+    println!();
+    println!("  Root process:    {application}");
+    println!("  Root PID:        {pid}");
+    println!("  Processes seen:  {}", active.len());
+    println!("  Saved locally:   yes");
+    println!("  Database:        {}", database_path.display());
+    println!("  Run ID:          {run_id}");
+    println!();
+    println!("Watching process starts and exits. Press Ctrl+C to stop.");
+
+    let mut stop_reason = "stopped by user";
+    let mut pending_events = queued_events.into_iter();
+
+    'watch: loop {
+        let incoming = if let Some(event) = pending_events.next() {
+            Some(event)
+        } else if stop_requested.load(Ordering::SeqCst) {
+            None
+        } else {
+            match receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => Some(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'watch,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Windows process event watchers disconnected.".to_string());
+                }
+            }
+        };
+
+        let Some(event) = incoming else {
+            break 'watch;
+        };
+
+        match event {
+            ProcessWatchEvent::Start(event) => {
+                let timestamp_ms = collectors::windows_process::WindowsProcessCollector::now_ms();
+
+                let depth = active
+                    .get(&event.parent_process_id)
+                    .map(|parent| parent.depth.saturating_add(1))
+                    .or_else(|| {
+                        let processes = collectors::windows_process::WindowsProcessCollector::enumerate_processes().ok()?;
+                        classify_process_depth(&processes, pid, event.process_id)
+                    });
+
+                let Some(depth) = depth else {
+                    continue 'watch;
+                };
+
+                if active.contains_key(&event.process_id) {
+                    continue 'watch;
+                }
+
+                sequence = sequence.wrapping_add(1);
+                let runtime_event = build_process_lifecycle_event(
+                    &run_id,
+                    sequence,
+                    pid,
+                    timestamp_ms,
+                    &event,
+                    depth,
+                );
+
+                active.insert(
+                    event.process_id,
+                    ActiveProcess {
+                        name: event.process_name.clone(),
+                        depth,
+                    },
+                );
+                passport.observe(&runtime_event);
+                storage::append_event(&mut connection, &run_id, &runtime_event)
+                    .map_err(|error| error.to_string())?;
+
+                println!(
+                    "  + process started: {} (PID {}, depth {})",
+                    event.process_name, event.process_id, depth
+                );
+            }
+            ProcessWatchEvent::Exit(event) => {
+                let Some(previous) = active.get(&event.process_id).cloned() else {
+                    continue 'watch;
+                };
+
+                // The stop notification identifies the process by PID and name.
+                // ParentProcessId is not required to match the bootstrap record,
+                // especially for the root process where Windows may report a
+                // different or unavailable parent at exit time.
+                if previous.name != event.process_name {
+                    continue 'watch;
+                }
+
+                sequence = sequence.wrapping_add(1);
+                let relationship = if event.process_id == pid {
+                    "root"
+                } else {
+                    "child"
+                };
+                let runtime_event = build_process_exit_event(
+                    &run_id,
+                    sequence,
+                    pid,
+                    collectors::windows_process::WindowsProcessCollector::now_ms(),
+                    &event,
+                    previous.depth,
+                    relationship,
+                );
+
+                active.remove(&event.process_id);
+                passport.observe(&runtime_event);
+                storage::append_event(&mut connection, &run_id, &runtime_event)
+                    .map_err(|error| error.to_string())?;
+
+                println!(
+                    "  - process exited: {} (PID {}, exit status {})",
+                    event.process_name, event.process_id, event.exit_status
+                );
+
+                if event.process_id == pid {
+                    stop_reason = "root process exited";
+                    break 'watch;
+                }
+            }
+            ProcessWatchEvent::Ready(source) => match source {
+                WatchSource::Starts | WatchSource::Exits => {}
+            },
+            ProcessWatchEvent::Error(message) => {
+                return Err(message);
+            }
+        }
+    }
+
+    let ended_at_ms = collectors::windows_process::WindowsProcessCollector::now_ms();
+    let final_passport = passport.finish(&run_id, ended_at_ms, &application);
+    storage::finish_run(&mut connection, &run_id, ended_at_ms, &final_passport)
+        .map_err(|error| error.to_string())?;
+
+    println!();
+    println!("Watch finished: {stop_reason}");
+    println!("  Events saved:   {sequence}");
+    println!("  Active at stop: {}", active.len());
+    println!("  Run ID:         {run_id}");
+    println!("  Passport ID:    {}", final_passport.passport_id);
 
     Ok(())
 }
@@ -223,6 +458,30 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("watch") => match args.next().and_then(|value| value.parse::<u32>().ok()) {
+            Some(pid) => {
+                #[cfg(windows)]
+                {
+                    match run_watch(pid) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("TraceFact could not watch process {pid}: {error}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = pid;
+                    eprintln!("The Windows process watcher is available only on Windows.");
+                    ExitCode::FAILURE
+                }
+            }
+            None => {
+                eprintln!("Usage: tracefact watch <pid>");
+                ExitCode::FAILURE
+            }
+        },
         Some("process") => match args.next().and_then(|value| value.parse::<u32>().ok()) {
             Some(pid) => match run_process(pid) {
                 Ok(()) => ExitCode::SUCCESS,

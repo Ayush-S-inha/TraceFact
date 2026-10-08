@@ -19,3 +19,5 @@ panic = "abort"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = ">=0.59, <=0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+wmi = "0.18"
+ctrlc = "3"

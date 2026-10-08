@@ -2,7 +2,7 @@
 
 > See what your software actually does.
 
-TraceFact watches an application while it is running and builds a local record of its behavior. The project is being built so that behavior can be compared with earlier runs and unexpected changes can be investigated.
+TraceFact watches an application while it runs and builds a local record of its behavior. The project is being built so that behavior can be compared with earlier runs and unexpected changes can be investigated.
 
 ## The idea
 
@@ -20,13 +20,15 @@ PROOF
 
 ## Current state
 
-The foundation is in place.
+The Windows process collector is working in two modes.
 
-TraceFact currently has a Windows process collector that can inspect a selected process tree, build a Runtime Passport, and save the observation to local SQLite storage. The command line interface can list saved runs and inspect them later.
+`tracefact process <pid>` takes a point in time snapshot of a selected process tree, builds a Runtime Passport, and saves the result to local SQLite storage.
 
-The collector records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines.
+`tracefact watch <pid>` keeps the selected process tree under observation. It records process start and exit events as they happen, saves them to SQLite, and finishes the run with an updated Runtime Passport.
 
-The next collectors and analysis features will be added as separate parts of the project.
+The process observer records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines.
+
+Network, filesystem, runtime dependency, comparison, security, and interface work will be added separately.
 
 ## Try it
 
@@ -34,27 +36,14 @@ Build the project with Cargo, then give TraceFact the PID of a running Windows p
 
 ```text
 tracefact process <pid>
+tracefact watch <pid>
 tracefact history
 tracefact inspect latest
 ```
 
-The process command saves the observation locally. The history command lists saved runs, and the inspect command shows the stored event data and Runtime Passport for one run.
+The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. History lists saved runs, and inspect shows the stored events and Runtime Passport.
 
-## Planned
-
-The next parts of the project are:
-
-* network observation
-* filesystem observation
-* runtime dependency observations
-* comparison between runs
-* basic security checks
-* local web interface
-* reports and passport exports
-* deeper Linux collection
-* optional AI explanations
-
-These features are not all implemented yet.
+The current Windows event watcher should be run from an Administrator PowerShell. Without the required WMI permissions, Windows can reject the event subscription.
 
 ## Privacy
 

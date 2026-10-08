@@ -1,53 +1,77 @@
 use std::collections::BTreeSet;
 
 use crate::model::{
-    BehaviorChange, ChangeKind, PassportObservations, RuntimePassport, RuntimeSnapshot,
+    BehaviorChange, ChangeKind, EventType, PassportObservations, RuntimeEvent, RuntimePassport,
+    RuntimeSnapshot,
 };
 
-pub fn passport_from_snapshot(snapshot: &RuntimeSnapshot, generated_at_ms: i64) -> RuntimePassport {
-    let mut observations = PassportObservations::default();
+#[derive(Debug, Default)]
+pub struct PassportAccumulator {
+    processes: BTreeSet<String>,
+    network_targets: BTreeSet<String>,
+    files: BTreeSet<String>,
+    libraries: BTreeSet<String>,
+}
 
-    for event in &snapshot.events {
+impl PassportAccumulator {
+    pub fn observe(&mut self, event: &RuntimeEvent) {
         match event.event_type {
-            crate::model::EventType::ProcessStart
-            | crate::model::EventType::ProcessExit
-            | crate::model::EventType::ProcessObserved => {
-                observations
-                    .processes
-                    .push(event.process.executable.clone());
+            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved => {
+                self.processes.insert(event.process.executable.clone());
             }
-            crate::model::EventType::NetworkConnection | crate::model::EventType::DnsLookup => {
+            EventType::NetworkConnection | EventType::DnsLookup => {
                 if let Some(target) = &event.target {
-                    observations.network_targets.push(target.clone());
+                    self.network_targets.insert(target.clone());
                 }
             }
-            crate::model::EventType::FileAccess => {
+            EventType::FileAccess => {
                 if let Some(target) = &event.target {
-                    observations.files.push(target.clone());
+                    self.files.insert(target.clone());
                 }
             }
-            crate::model::EventType::LibraryLoaded => {
+            EventType::LibraryLoaded => {
                 if let Some(target) = &event.target {
-                    observations.libraries.push(target.clone());
+                    self.libraries.insert(target.clone());
                 }
             }
-            crate::model::EventType::EnvironmentVariableUsed => {}
+            EventType::EnvironmentVariableUsed => {}
         }
     }
 
-    dedupe(&mut observations.processes);
-    dedupe(&mut observations.network_targets);
-    dedupe(&mut observations.files);
-    dedupe(&mut observations.libraries);
-
-    RuntimePassport {
-        schema_version: "0.1".into(),
-        passport_id: format!("passport-{}", snapshot.snapshot_id),
-        generated_at_ms,
-        application: snapshot.application.clone(),
-        observations,
-        changes: vec![],
+    pub fn finish(
+        self,
+        snapshot_id: &str,
+        generated_at_ms: i64,
+        application: &str,
+    ) -> RuntimePassport {
+        RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: format!("passport-{snapshot_id}"),
+            generated_at_ms,
+            application: application.to_string(),
+            observations: PassportObservations {
+                processes: self.processes.into_iter().collect(),
+                network_targets: self.network_targets.into_iter().collect(),
+                files: self.files.into_iter().collect(),
+                libraries: self.libraries.into_iter().collect(),
+            },
+            changes: vec![],
+        }
     }
+}
+
+pub fn passport_from_snapshot(snapshot: &RuntimeSnapshot, generated_at_ms: i64) -> RuntimePassport {
+    let mut accumulator = PassportAccumulator::default();
+
+    for event in &snapshot.events {
+        accumulator.observe(event);
+    }
+
+    accumulator.finish(
+        &snapshot.snapshot_id,
+        generated_at_ms,
+        &snapshot.application,
+    )
 }
 
 pub fn compare(a: &RuntimePassport, b: &RuntimePassport) -> Vec<BehaviorChange> {
@@ -100,9 +124,4 @@ fn compare_set(changes: &mut Vec<BehaviorChange>, category: &str, old: &[String]
             reason: format!("It was seen in the baseline but not in the current run."),
         });
     }
-}
-
-fn dedupe(values: &mut Vec<String>) {
-    values.sort();
-    values.dedup();
 }
