@@ -1,5 +1,7 @@
 pub mod demo;
 #[cfg(windows)]
+pub mod windows_network;
+#[cfg(windows)]
 pub mod windows_process;
 
 use std::error::Error;

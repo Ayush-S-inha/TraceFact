@@ -21,3 +21,4 @@ panic = "abort"
 windows-sys = { version = ">=0.59, <=0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 wmi = "0.18"
 ctrlc = "3"
+windows-erg = "0.2"

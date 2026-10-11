@@ -26,6 +26,13 @@ pub(crate) struct ProcessRecord {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ProcessTreeMember {
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone)]
 struct SelectedProcess {
     pid: u32,
     parent_pid: u32,
@@ -468,6 +475,25 @@ pub fn build_process_exit_event(
         source: "windows_process_watch".to_string(),
         sensitivity: Sensitivity::SystemMetadata,
     }
+}
+
+pub(crate) fn identify_process_in_tree(
+    root_pid: u32,
+    target_pid: u32,
+) -> Result<Option<ProcessTreeMember>, CollectorError> {
+    let processes = WindowsProcessCollector::enumerate_processes()?;
+    let Some(depth) = classify_process_depth(&processes, root_pid, target_pid) else {
+        return Ok(None);
+    };
+    let Some(process) = processes.iter().find(|process| process.pid == target_pid) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ProcessTreeMember {
+        parent_pid: Some(process.parent_pid).filter(|pid| *pid != 0),
+        name: process.name.clone(),
+        depth,
+    }))
 }
 
 pub(crate) fn classify_process_depth(

@@ -28,7 +28,9 @@ The Windows process collector is working in two modes.
 
 The process observer records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines.
 
-Network, filesystem, runtime dependency, comparison, security, and interface work will be added separately.
+The watch command also includes an experimental Windows TCP observer. It records connection metadata for processes in the selected tree, including endpoint addresses and ports. It does not store network payloads. The network observer requires an Administrator PowerShell and is still being validated on Windows systems.
+
+Filesystem observation, runtime dependency tracking, comparison, security checks, and the interface are separate stages of the project.
 
 ## Try it
 
@@ -43,7 +45,7 @@ tracefact inspect latest
 
 The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. History lists saved runs, and inspect shows the stored events and Runtime Passport.
 
-The current Windows event watcher should be run from an Administrator PowerShell. Without the required WMI permissions, Windows can reject the event subscription.
+The Windows process watcher and TCP observer should be run from an Administrator PowerShell. Windows can reject WMI event subscriptions or kernel network tracing when the process lacks the required permissions. A network tracing session can also fail if another kernel tracing session is already active.
 
 ## Privacy
 

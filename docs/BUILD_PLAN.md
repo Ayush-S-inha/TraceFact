@@ -8,7 +8,9 @@ TraceFact watches software while it runs and tells the developer what it actuall
 
 The first Windows process collector is working. It can inspect a selected process tree, build a Runtime Passport, and save the observation to local SQLite storage.
 
-Continuous Windows process observation is also working. The watcher records process start and exit events for the selected process tree, persists them as they arrive, and finalizes the run with an updated Runtime Passport.
+Continuous Windows process observation is working. The watcher records process start and exit events for the selected process tree, persists them as they arrive, and finalizes the run with an updated Runtime Passport.
+
+Windows TCP destination observation has been implemented as the next collector and is awaiting live validation on the target Windows system. It records TCP connection lifecycle metadata for the selected process tree without saving application payloads.
 
 ## Build order
 
@@ -17,7 +19,7 @@ Continuous Windows process observation is also working. The watcher records proc
 3. Windows process and process tree observer
 4. Local persistence for collected runs
 5. Continuous Windows process observation (working)
-6. Network destination and port observer
+6. Network destination and port observer (implemented, awaiting live validation)
 7. Filesystem observer
 8. Runtime and library observer
 9. Runtime Passport improvements
