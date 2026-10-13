@@ -28,6 +28,8 @@ pub struct NetworkTraceDiagnostics {
     pub observations_enqueued: u64,
     pub event_shapes: BTreeMap<String, u64>,
     pub additional_shape_event_count: u64,
+    /// Terminal ETW errors are retained here even when the bounded message queue is full.
+    pub stream_error: Option<String>,
     pub raw_event_samples: Vec<String>,
     pub tcp_event_samples: Vec<String>,
 }
@@ -189,6 +191,31 @@ impl Drop for WindowsNetworkEventWatcher {
     }
 }
 
+fn raw_event_sample(event_shape: &str, payload_bytes: usize) -> String {
+    format!("{event_shape} payload_bytes={payload_bytes} decoded_as=non_tcp")
+}
+
+fn classic_tcp_sample(event_shape: &str, operation: NetworkOperation) -> String {
+    format!(
+        "{event_shape} operation={} endpoint_data=redacted",
+        operation.as_str()
+    )
+}
+
+fn decoded_tcp_sample(
+    event_shape: &str,
+    operation: &str,
+    payload_pid_present: bool,
+    source_ip_present: bool,
+    source_port_present: bool,
+    destination_ip_present: bool,
+    destination_port_present: bool,
+) -> String {
+    format!(
+        "{event_shape} operation={operation} payload_pid_present={payload_pid_present} source_ip_present={source_ip_present} source_port_present={source_port_present} destination_ip_present={destination_ip_present} destination_port_present={destination_port_present}"
+    )
+}
+
 fn run_trace(
     mut trace: EventTrace,
     sender: SyncSender<NetworkWatchMessage>,
@@ -204,10 +231,12 @@ fn run_trace(
         let count = match trace.next_batch(&mut batch) {
             Ok(count) => count,
             Err(error) => {
-                let message = NetworkWatchMessage::Error(format!(
-                    "Windows TCP/IP event stream failed: {error}"
-                ));
-                match sender.try_send(message) {
+                let message = format!("Windows TCP/IP event stream failed: {error}");
+                diagnostics.stream_error = Some(message.clone());
+                // Preserve the terminal error outside the bounded queue as well.
+                // If the queue is full, the main thread can still report this after shutdown.
+                publish_diagnostics(&shared_diagnostics, &diagnostics);
+                match sender.try_send(NetworkWatchMessage::Error(message)) {
                     Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
                 }
                 break;
@@ -232,16 +261,9 @@ fn run_trace(
                 ClassicTcpIpDecode::Observation(observation) => {
                     diagnostics.tcp_events_decoded =
                         diagnostics.tcp_events_decoded.saturating_add(1);
-                    let tcp_sample = format!(
-                        "{} payload_pid={} operation={} source={}:{} destination={}:{}",
-                        event_shape(event),
-                        observation.process_id,
-                        observation.operation.as_str(),
-                        observation.source_ip,
-                        observation.source_port,
-                        observation.destination_ip,
-                        observation.destination_port
-                    );
+                    // Diagnostics are system-wide at the ETW source. Keep samples
+                    // schema-only so unrelated process IDs and endpoints are not exposed.
+                    let tcp_sample = classic_tcp_sample(&event_shape(event), observation.operation);
                     match sender.try_send(NetworkWatchMessage::Event(observation)) {
                         Ok(()) => {
                             diagnostics.observations_enqueued =
@@ -282,25 +304,22 @@ fn run_trace(
             let DecodedEvent::Tcp(tcp) = decoded else {
                 diagnostics.other_events_decoded =
                     diagnostics.other_events_decoded.saturating_add(1);
-                diagnostics.record_raw_sample(format!(
-                    "{} header_pid={} payload_bytes={} decoded_as=non_tcp",
-                    event_shape(event),
-                    event.process_id.as_u32(),
-                    event.data.len()
-                ));
+                diagnostics
+                    .record_raw_sample(raw_event_sample(&event_shape(event), event.data.len()));
                 continue;
             };
 
             diagnostics.tcp_events_decoded = diagnostics.tcp_events_decoded.saturating_add(1);
-            let tcp_sample = format!(
-                "{} operation={:?} payload_pid={:?} source_ip={:?} source_port={:?} destination_ip={:?} destination_port={:?}",
-                event_shape(event),
-                tcp.operation,
-                tcp.process_id.as_ref().map(|value| value.as_u32()),
-                tcp.source_ip.as_ref(),
-                tcp.source_port.as_ref(),
-                tcp.destination_ip.as_ref(),
-                tcp.destination_port.as_ref()
+            // Report field availability without putting process IDs, IP addresses,
+            // or port values from unrelated system traffic into diagnostics.
+            let tcp_sample = decoded_tcp_sample(
+                &event_shape(event),
+                &format!("{:?}", tcp.operation),
+                tcp.process_id.is_some(),
+                tcp.source_ip.is_some(),
+                tcp.source_port.is_some(),
+                tcp.destination_ip.is_some(),
+                tcp.destination_port.is_some(),
             );
 
             if supported_operation(tcp.operation).is_none() {
@@ -691,6 +710,24 @@ mod tests {
             decode_classic_tcpip_payload(12, 2, &[0; 28], UNIX_EPOCH),
             ClassicTcpIpDecode::Incomplete(_)
         ));
+    }
+
+    #[test]
+    fn diagnostic_samples_do_not_include_process_ids_or_endpoint_values() {
+        let event_shape = "id=0 version=2 opcode=12 provider=classic-tcpip";
+        let raw = raw_event_sample(event_shape, 44);
+        let classic = classic_tcp_sample(event_shape, NetworkOperation::Connect);
+        let decoded = decoded_tcp_sample(event_shape, "Connect", true, true, true, true, true);
+
+        for sample in [&raw, &classic, &decoded] {
+            assert!(!sample.contains("payload_pid=1234"));
+            assert!(!sample.contains("203.0.113.17"));
+            assert!(!sample.contains("127.0.0.1"));
+            assert!(!sample.contains("destination_port=443"));
+        }
+
+        assert!(classic.contains("endpoint_data=redacted"));
+        assert!(decoded.contains("payload_pid_present=true"));
     }
 
     #[test]

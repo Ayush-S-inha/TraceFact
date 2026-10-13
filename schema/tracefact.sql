@@ -5,7 +5,9 @@ CREATE TABLE IF NOT EXISTS runs (
     application TEXT NOT NULL,
     started_at_ms INTEGER NOT NULL,
     ended_at_ms INTEGER,
-    schema_version TEXT NOT NULL
+    schema_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed'
+        CHECK (status IN ('running', 'completed', 'interrupted', 'failed'))
 );
 
 CREATE TABLE IF NOT EXISTS events (

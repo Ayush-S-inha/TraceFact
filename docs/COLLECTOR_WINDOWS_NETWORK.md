@@ -18,12 +18,12 @@ The collector uses Windows Event Tracing for Windows with the kernel TCP/IP prov
 
 Kernel network events are system-wide at the source. TraceFact uses the process ID inside the decoded TCP event payload, then checks whether that process belongs to the selected process tree before saving the event. The event header process ID is not used as the network process attribution source.
 
-If an event arrives before the process start notification has been added to the in-memory tree, TraceFact takes a process snapshot and checks the parent chain. PIDs found to be outside the selected tree are briefly cached to avoid repeatedly taking snapshots for unrelated system traffic.
+If an event arrives before the process start notification has been added to the in-memory tree, TraceFact takes a process snapshot and checks the parent chain. PIDs found to be outside the selected tree are briefly cached to avoid repeatedly taking snapshots for unrelated system traffic. If that snapshot itself fails, the event is not persisted because its membership cannot be verified; TraceFact counts the attribution failure and continues observing rather than immediately aborting the run.
 
 ## Limits and privacy
 
 ETW is a live event source, not a packet archive. Events can be missed when Windows or an event queue is overloaded. TraceFact bounds the application queue and reports how many events were dropped by that queue. It cannot report losses inside the underlying Windows ETW delivery channel unless that source exposes a loss counter through the selected API.
 
-The collector keeps only structured connection metadata in its own event queue. Network events from unrelated process trees are not persisted. The Runtime Passport adds observed peer endpoints from connect and accept events, rather than every address seen on the computer.
+The collector keeps only structured connection metadata in its own event queue. Network events from unrelated process trees are not persisted. Diagnostic samples retain event shapes, field-presence flags, payload lengths, and decoding reasons, but do not print process IDs, IP addresses, or port values from system-wide traffic. The Runtime Passport adds observed peer endpoints from connect and accept events, rather than every address seen on the computer.
 
 The collector is experimental until it has passed live tests on the target Windows system. Its startup can fail because of missing privileges or a conflicting kernel trace session. Such failures should be shown to the user, not treated as an empty network observation.

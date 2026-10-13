@@ -16,10 +16,12 @@ TraceFact does not send the database to a TraceFact server.
 
 A saved run contains:
 
-* run metadata
+* run metadata, including `running`, `completed`, `interrupted`, or `failed` status
 * process observation events
 * event metadata
 * the generated Runtime Passport
+
+Watch startup and its bootstrap events are inserted in one SQLite transaction. Finalization updates the end timestamp, terminal status, and final Runtime Passport together. When opening an older database, TraceFact adds the status column and classifies records with no end timestamp as interrupted rather than treating them as clean completions.
 
 The current Windows process collector does not collect command lines or file contents.
 
@@ -45,4 +47,4 @@ The history and inspect commands read the local database only. If the database d
 
 ## Testing
 
-The storage module includes round trip tests using an in memory SQLite database. The tests verify that a run, event, and Passport can be saved and read through the storage layer, that a stored run can be inspected, and that the history limit is applied.
+The storage module includes round trip tests using an in memory SQLite database. The tests verify the run lifecycle, atomic bootstrap persistence and rollback, legacy status migration, terminal status recording, run inspection, and history listing.

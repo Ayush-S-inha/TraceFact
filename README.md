@@ -43,7 +43,7 @@ tracefact history
 tracefact inspect latest
 ```
 
-The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. History lists saved runs, and inspect shows the stored events and Runtime Passport.
+The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
 
 The Windows process watcher and TCP observer should be run from an Administrator PowerShell. Windows can reject WMI event subscriptions or kernel network tracing when the process lacks the required permissions. A network tracing session can also fail if another kernel tracing session is already active.
 

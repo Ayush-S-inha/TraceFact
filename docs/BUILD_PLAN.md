@@ -10,7 +10,15 @@ The first Windows process collector is working. It can inspect a selected proces
 
 Continuous Windows process observation is working. The watcher records process start and exit events for the selected process tree, persists them as they arrive, and finalizes the run with an updated Runtime Passport.
 
-Windows TCP destination observation has been implemented as the next collector and is awaiting live validation on the target Windows system. It records TCP connection lifecycle metadata for the selected process tree without saving application payloads.
+Windows TCP destination observation has been implemented as the next collector. An initial live test on Windows observed an outbound HTTPS connection and its disconnect event, but broader validation across process trees, IPv6, permissions, and failure conditions remains outstanding. The collector records TCP connection lifecycle metadata for the selected process tree without saving application payloads.
+
+## Part 1 hardening checkpoint
+
+The first hardening pass keeps diagnostic samples free of process IDs and endpoint values, retains terminal ETW stream errors even when the bounded message queue is full, and treats failed process-tree attribution as an explicit counted condition instead of immediately ending the watch. Windows build and live regression verification remain outstanding.
+
+## Part 2 lifecycle checkpoint
+
+Watch runs now have a persisted lifecycle status. Bootstrap events are inserted atomically with the run record, watch-loop errors are captured for shutdown, and the network observer is stopped before a final queue drain and passport update are attempted. Ctrl+C drains queued process events up to a fixed limit and reports when that limit is exceeded. The WMI process notification iterators still do not have a cooperative cancellation path in this checkpoint, so a clean cross-collector shutdown has not yet been fully verified.
 
 ## Build order
 
@@ -19,7 +27,7 @@ Windows TCP destination observation has been implemented as the next collector a
 3. Windows process and process tree observer
 4. Local persistence for collected runs
 5. Continuous Windows process observation (working)
-6. Network destination and port observer (implemented, awaiting live validation)
+6. Network destination and port observer (initial live test passed; broader validation outstanding)
 7. Filesystem observer
 8. Runtime and library observer
 9. Runtime Passport improvements

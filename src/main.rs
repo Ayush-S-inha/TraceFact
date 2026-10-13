@@ -147,6 +147,14 @@ struct TrackedNetworkFlow {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetworkPersistOutcome {
+    Saved,
+    Filtered,
+    AttributionUnavailable(String),
+}
+
+#[cfg(windows)]
 fn cached_process_for_disconnect(
     operation: collectors::windows_network::NetworkOperation,
     flow_key: &NetworkFlowKey,
@@ -168,11 +176,12 @@ fn persist_network_observation(
     run_id: &str,
     active: &BTreeMap<u32, ActiveProcess>,
     ignored_pids_until: &mut HashMap<u32, Instant>,
+    unresolved_pids_until: &mut HashMap<u32, Instant>,
     flow_targets: &mut HashMap<NetworkFlowKey, TrackedNetworkFlow>,
     connection: &mut rusqlite::Connection,
     passport: &mut analysis::PassportAccumulator,
     sequence: &mut u64,
-) -> Result<bool, String> {
+) -> Result<NetworkPersistOutcome, String> {
     use collectors::windows_network::{endpoint, NetworkOperation};
 
     const FLOW_CACHE_LIMIT: usize = 8192;
@@ -180,6 +189,7 @@ fn persist_network_observation(
 
     let now = Instant::now();
     ignored_pids_until.retain(|_, expires_at| *expires_at > now);
+    unresolved_pids_until.retain(|_, expires_at| *expires_at > now);
 
     let source = SocketAddr::new(observation.source_ip, observation.source_port);
     let destination = SocketAddr::new(observation.destination_ip, observation.destination_port);
@@ -200,18 +210,41 @@ fn persist_network_observation(
             .get(&observation.process_id)
             .is_some_and(|expires_at| *expires_at > now)
         {
-            return Ok(false);
+            return Ok(NetworkPersistOutcome::Filtered);
         }
 
-        let member =
-            collectors::windows_process::identify_process_in_tree(root_pid, observation.process_id)
-                .map_err(|error| error.to_string())?;
+        if unresolved_pids_until
+            .get(&observation.process_id)
+            .is_some_and(|expires_at| *expires_at > now)
+        {
+            return Ok(NetworkPersistOutcome::AttributionUnavailable(
+                "A recent process snapshot failed, so membership remains unverified.".to_string(),
+            ));
+        }
+
+        let member = match collectors::windows_process::identify_process_in_tree(
+            root_pid,
+            observation.process_id,
+        ) {
+            Ok(member) => member,
+            Err(error) => {
+                // A transient process snapshot failure must not abort the entire watch.
+                // Cache the failure briefly to avoid repeating a system snapshot for every event.
+                if unresolved_pids_until.len() < 4096 {
+                    unresolved_pids_until
+                        .insert(observation.process_id, now + NEGATIVE_PID_CACHE_TTL);
+                }
+                return Ok(NetworkPersistOutcome::AttributionUnavailable(
+                    error.to_string(),
+                ));
+            }
+        };
 
         let Some(member) = member else {
             if ignored_pids_until.len() < 4096 {
                 ignored_pids_until.insert(observation.process_id, now + NEGATIVE_PID_CACHE_TTL);
             }
-            return Ok(false);
+            return Ok(NetworkPersistOutcome::Filtered);
         };
 
         ActiveProcess {
@@ -251,14 +284,14 @@ fn persist_network_observation(
         NetworkOperation::Disconnect => flow_targets.remove(&flow_key).map(|flow| flow.target),
     };
 
-    *sequence = (*sequence).wrapping_add(1);
+    let next_sequence = (*sequence).wrapping_add(1);
     let relationship = if observation.process_id == root_pid {
         "root"
     } else {
         "child"
     };
     let runtime_event = model::RuntimeEvent {
-        id: format!("{run_id}-event-{sequence}"),
+        id: format!("{run_id}-event-{next_sequence}"),
         timestamp_ms: observation.timestamp_ms,
         event_type: model::EventType::NetworkConnection,
         process: model::ProcessIdentity {
@@ -286,6 +319,7 @@ fn persist_network_observation(
     };
 
     storage::append_event(connection, run_id, &runtime_event).map_err(|error| error.to_string())?;
+    *sequence = next_sequence;
     passport.observe(&runtime_event);
 
     match observation.operation {
@@ -313,7 +347,7 @@ fn persist_network_observation(
         ),
     }
 
-    Ok(true)
+    Ok(NetworkPersistOutcome::Saved)
 }
 
 #[cfg(windows)]
@@ -324,39 +358,68 @@ fn drain_network_queue(
     run_id: &str,
     active: &BTreeMap<u32, ActiveProcess>,
     ignored_pids_until: &mut HashMap<u32, Instant>,
+    unresolved_pids_until: &mut HashMap<u32, Instant>,
     flow_targets: &mut HashMap<NetworkFlowKey, TrackedNetworkFlow>,
     connection: &mut rusqlite::Connection,
     passport: &mut analysis::PassportAccumulator,
     sequence: &mut u64,
     network_events_saved: &mut u64,
     network_events_filtered: &mut u64,
+    network_attribution_failures: &mut u64,
+    first_attribution_error: &mut Option<String>,
 ) -> Result<Option<String>, String> {
     use collectors::windows_network::NetworkWatchMessage;
     use std::sync::mpsc::TryRecvError;
 
+    // Yield back to the process-event watcher regularly, even if ETW keeps
+    // producing records while this queue is being drained.
+    const MAX_MESSAGES_PER_DRAIN: usize = 1024;
+
     let mut first_error = None;
+    let mut drained = 0_usize;
     loop {
+        if drained >= MAX_MESSAGES_PER_DRAIN {
+            break;
+        }
+
         match receiver.try_recv() {
-            Ok(NetworkWatchMessage::Event(observation)) => {
-                if persist_network_observation(
-                    observation,
-                    root_pid,
-                    run_id,
-                    active,
-                    ignored_pids_until,
-                    flow_targets,
-                    connection,
-                    passport,
-                    sequence,
-                )? {
-                    *network_events_saved = (*network_events_saved).wrapping_add(1);
-                } else {
-                    *network_events_filtered = (*network_events_filtered).wrapping_add(1);
-                }
-            }
-            Ok(NetworkWatchMessage::Error(message)) => {
-                if first_error.is_none() {
-                    first_error = Some(message);
+            Ok(message) => {
+                drained += 1;
+                match message {
+                    NetworkWatchMessage::Event(observation) => {
+                        match persist_network_observation(
+                            observation,
+                            root_pid,
+                            run_id,
+                            active,
+                            ignored_pids_until,
+                            unresolved_pids_until,
+                            flow_targets,
+                            connection,
+                            passport,
+                            sequence,
+                        )? {
+                            NetworkPersistOutcome::Saved => {
+                                *network_events_saved = (*network_events_saved).wrapping_add(1);
+                            }
+                            NetworkPersistOutcome::Filtered => {
+                                *network_events_filtered =
+                                    (*network_events_filtered).wrapping_add(1);
+                            }
+                            NetworkPersistOutcome::AttributionUnavailable(message) => {
+                                *network_attribution_failures =
+                                    (*network_attribution_failures).wrapping_add(1);
+                                if first_attribution_error.is_none() {
+                                    *first_attribution_error = Some(message);
+                                }
+                            }
+                        }
+                    }
+                    NetworkWatchMessage::Error(message) => {
+                        if first_error.is_none() {
+                            first_error = Some(message);
+                        }
+                    }
                 }
             }
             Err(TryRecvError::Empty) => break,
@@ -389,18 +452,46 @@ fn run_watch(pid: u32) -> Result<(), String> {
         .unwrap_or(0);
     let run_id = format!("watch-{started_at_ms}-{pid}");
 
+    // Install Ctrl+C handling before any run record is created. A handler setup
+    // failure must not leave an unfinished run in the database.
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_handler = Arc::clone(&stop_requested);
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
+
     let (mut connection, database_path) =
         storage::open_default().map_err(|error| error.to_string())?;
+
+    // Start ETW first so failures to start it do not leave the WMI watcher
+    // threads running in the background without a consumer.
+    let mut network_watcher =
+        WindowsNetworkEventWatcher::start().map_err(|error| error.to_string())?;
     let watcher = WindowsProcessEventWatcher::start();
     let receiver = watcher.receiver();
 
-    let queued_events =
-        wait_for_watchers(receiver, Duration::from_secs(10)).map_err(|error| error.to_string())?;
+    let queued_events = match wait_for_watchers(receiver, Duration::from_secs(10)) {
+        Ok(events) => events,
+        Err(error) => {
+            let stop_result = network_watcher.stop();
+            return Err(match stop_result {
+                Ok(()) => error.to_string(),
+                Err(stop_error) => format!("{error}; additionally, {stop_error}"),
+            });
+        }
+    };
 
-    let mut network_watcher =
-        WindowsNetworkEventWatcher::start().map_err(|error| error.to_string())?;
-
-    let initial_events = snapshot_process_tree(pid, &run_id).map_err(|error| error.to_string())?;
+    let initial_events = match snapshot_process_tree(pid, &run_id) {
+        Ok(events) => events,
+        Err(error) => {
+            let stop_result = network_watcher.stop();
+            return Err(match stop_result {
+                Ok(()) => error.to_string(),
+                Err(stop_error) => format!("{error}; additionally, {stop_error}"),
+            });
+        }
+    };
     let root_event = initial_events
         .iter()
         .find(|event| event.process.pid == pid)
@@ -417,15 +508,23 @@ fn run_watch(pid: u32) -> Result<(), String> {
     };
     let initial_passport =
         analysis::PassportAccumulator::default().finish(&run_id, started_at_ms, &application);
-    storage::begin_run(&mut connection, &initial_snapshot, &initial_passport)
-        .map_err(|error| error.to_string())?;
+    storage::begin_run_with_events(
+        &mut connection,
+        &initial_snapshot,
+        &initial_passport,
+        &initial_events,
+    )
+    .map_err(|error| error.to_string())?;
 
     let mut active = BTreeMap::<u32, ActiveProcess>::new();
     let mut passport = analysis::PassportAccumulator::default();
     let mut sequence = 0_u64;
     let mut network_events_saved = 0_u64;
     let mut network_events_filtered = 0_u64;
+    let mut network_attribution_failures = 0_u64;
+    let mut first_attribution_error = None;
     let mut ignored_pids_until = HashMap::<u32, Instant>::new();
+    let mut unresolved_pids_until = HashMap::<u32, Instant>::new();
     let mut flow_targets = HashMap::<NetworkFlowKey, TrackedNetworkFlow>::new();
 
     for event in initial_events {
@@ -442,17 +541,8 @@ fn run_watch(pid: u32) -> Result<(), String> {
             },
         );
         passport.observe(&event);
-        storage::append_event(&mut connection, &run_id, &event)
-            .map_err(|error| error.to_string())?;
         sequence = sequence.wrapping_add(1);
     }
-
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let stop_handler = Arc::clone(&stop_requested);
-    ctrlc::set_handler(move || {
-        stop_handler.store(true, Ordering::SeqCst);
-    })
-    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
 
     println!("TraceFact process watch");
     println!();
@@ -465,10 +555,14 @@ fn run_watch(pid: u32) -> Result<(), String> {
     println!();
     println!("Watching process starts, exits, and TCP connection metadata. Press Ctrl+C to stop.");
 
+    const MAX_QUEUED_PROCESS_EVENTS_ON_STOP: usize = 4096;
+    let mut process_events_drained_after_stop = 0_usize;
+    let mut process_events_discarded_at_stop = 0_usize;
+    let mut process_queue_drain_limited = false;
     let mut stop_reason = "stopped by user";
     let mut network_error = None;
 
-    {
+    let watch_result = (|| -> Result<(), String> {
         let network_receiver = network_watcher.receiver();
         let mut pending_events = queued_events.into_iter();
 
@@ -480,12 +574,15 @@ fn run_watch(pid: u32) -> Result<(), String> {
                 &run_id,
                 &active,
                 &mut ignored_pids_until,
+                &mut unresolved_pids_until,
                 &mut flow_targets,
                 &mut connection,
                 &mut passport,
                 &mut sequence,
                 &mut network_events_saved,
                 &mut network_events_filtered,
+                &mut network_attribution_failures,
+                &mut first_attribution_error,
             )? {
                 network_error = Some(message);
                 stop_reason = "network observer stopped";
@@ -495,7 +592,29 @@ fn run_watch(pid: u32) -> Result<(), String> {
             let incoming = if let Some(event) = pending_events.next() {
                 Some(event)
             } else if stop_requested.load(Ordering::SeqCst) {
-                None
+                if process_events_drained_after_stop < MAX_QUEUED_PROCESS_EVENTS_ON_STOP {
+                    match receiver.try_recv() {
+                        Ok(event) => {
+                            process_events_drained_after_stop += 1;
+                            Some(event)
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                    }
+                } else {
+                    match receiver.try_recv() {
+                        Ok(_event) => {
+                            process_queue_drain_limited = true;
+                            process_events_discarded_at_stop = 1 + receiver
+                                .try_iter()
+                                .take(MAX_QUEUED_PROCESS_EVENTS_ON_STOP)
+                                .count();
+                            None
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+                    }
+                }
             } else {
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(event) => Some(event),
@@ -516,12 +635,12 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         collectors::windows_process::WindowsProcessCollector::now_ms();
 
                     let depth = active
-                    .get(&event.parent_process_id)
-                    .map(|parent| parent.depth.saturating_add(1))
-                    .or_else(|| {
-                        let processes = collectors::windows_process::WindowsProcessCollector::enumerate_processes().ok()?;
-                        classify_process_depth(&processes, pid, event.process_id)
-                    });
+                        .get(&event.parent_process_id)
+                        .map(|parent| parent.depth.saturating_add(1))
+                        .or_else(|| {
+                            let processes = collectors::windows_process::WindowsProcessCollector::enumerate_processes().ok()?;
+                            classify_process_depth(&processes, pid, event.process_id)
+                        });
 
                     let Some(depth) = depth else {
                         continue 'watch;
@@ -531,16 +650,19 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         continue 'watch;
                     }
 
-                    sequence = sequence.wrapping_add(1);
+                    let next_sequence = sequence.wrapping_add(1);
                     let runtime_event = build_process_lifecycle_event(
                         &run_id,
-                        sequence,
+                        next_sequence,
                         pid,
                         timestamp_ms,
                         &event,
                         depth,
                     );
+                    storage::append_event(&mut connection, &run_id, &runtime_event)
+                        .map_err(|error| error.to_string())?;
 
+                    sequence = next_sequence;
                     active.insert(
                         event.process_id,
                         ActiveProcess {
@@ -550,8 +672,6 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         },
                     );
                     passport.observe(&runtime_event);
-                    storage::append_event(&mut connection, &run_id, &runtime_event)
-                        .map_err(|error| error.to_string())?;
 
                     println!(
                         "  + process started: {} (PID {}, depth {})",
@@ -571,7 +691,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         continue 'watch;
                     }
 
-                    sequence = sequence.wrapping_add(1);
+                    let next_sequence = sequence.wrapping_add(1);
                     let relationship = if event.process_id == pid {
                         "root"
                     } else {
@@ -579,18 +699,19 @@ fn run_watch(pid: u32) -> Result<(), String> {
                     };
                     let runtime_event = build_process_exit_event(
                         &run_id,
-                        sequence,
+                        next_sequence,
                         pid,
                         collectors::windows_process::WindowsProcessCollector::now_ms(),
                         &event,
                         previous.depth,
                         relationship,
                     );
-
-                    active.remove(&event.process_id);
-                    passport.observe(&runtime_event);
                     storage::append_event(&mut connection, &run_id, &runtime_event)
                         .map_err(|error| error.to_string())?;
+
+                    sequence = next_sequence;
+                    active.remove(&event.process_id);
+                    passport.observe(&runtime_event);
 
                     println!(
                         "  - process exited: {} (PID {}, exit status {})",
@@ -610,6 +731,20 @@ fn run_watch(pid: u32) -> Result<(), String> {
                 }
             }
         }
+
+        Ok(())
+    })();
+
+    if let Err(message) = watch_result {
+        stop_reason = "watch interrupted by error";
+        match &mut network_error {
+            Some(existing) if existing != &message => {
+                existing.push_str("; additional watch error: ");
+                existing.push_str(&message);
+            }
+            Some(_) => {}
+            None => network_error = Some(message),
+        }
     }
 
     if let Err(error) = network_watcher.stop() {
@@ -618,37 +753,75 @@ fn run_watch(pid: u32) -> Result<(), String> {
         }
     }
 
-    if let Some(message) = drain_network_queue(
+    match drain_network_queue(
         network_watcher.receiver(),
         false,
         pid,
         &run_id,
         &active,
         &mut ignored_pids_until,
+        &mut unresolved_pids_until,
         &mut flow_targets,
         &mut connection,
         &mut passport,
         &mut sequence,
         &mut network_events_saved,
         &mut network_events_filtered,
-    )? {
-        if network_error.is_none() {
-            network_error = Some(message);
+        &mut network_attribution_failures,
+        &mut first_attribution_error,
+    ) {
+        Ok(Some(message)) => {
+            if network_error.is_none() {
+                network_error = Some(message);
+            }
+        }
+        Ok(None) => {}
+        Err(message) => {
+            if network_error.is_none() {
+                network_error = Some(format!("Could not fully drain network events: {message}"));
+            }
         }
     }
 
+    let network_diagnostics = network_watcher.diagnostics();
+    if network_error.is_none() {
+        network_error = network_diagnostics.stream_error.clone();
+    }
+
+    let terminal_status = if network_error.is_some() {
+        "failed"
+    } else if stop_reason == "root process exited" {
+        "completed"
+    } else {
+        "interrupted"
+    };
     let ended_at_ms = collectors::windows_process::WindowsProcessCollector::now_ms();
     let final_passport = passport.finish(&run_id, ended_at_ms, &application);
-    storage::finish_run(&mut connection, &run_id, ended_at_ms, &final_passport)
-        .map_err(|error| error.to_string())?;
-
-    let network_diagnostics = network_watcher.diagnostics();
+    storage::finish_run_with_status(
+        &mut connection,
+        &run_id,
+        ended_at_ms,
+        &final_passport,
+        terminal_status,
+    )
+    .map_err(|error| format!("Could not finalize run {run_id}: {error}"))?;
 
     println!();
     println!("Watch finished: {stop_reason}");
+    println!("  Status:               {terminal_status}");
     println!("  Events saved:         {sequence}");
     println!("  Network events saved: {network_events_saved}");
     println!("  Network events filtered: {network_events_filtered}");
+    println!("  Network events with unverified attribution: {network_attribution_failures}");
+    if process_queue_drain_limited {
+        println!(
+            "  Process events not drained at stop: at least {} (shutdown drain cap {})",
+            process_events_discarded_at_stop, MAX_QUEUED_PROCESS_EVENTS_ON_STOP
+        );
+    }
+    if let Some(message) = &first_attribution_error {
+        println!("  First attribution error: {message}");
+    }
     println!(
         "  Network queue drops:  {}",
         network_watcher.dropped_events()
@@ -747,6 +920,7 @@ fn run_inspect(run_id: &str) -> Result<(), String> {
     println!("  Run ID:          {}", run.run_id);
     println!("  Application:     {}", run.application);
     println!("  Schema version:  {}", run.schema_version);
+    println!("  Status:          {}", run.status);
     println!("  Started at:      {}", run.started_at_ms);
     println!(
         "  Ended at:        {}",
@@ -813,13 +987,13 @@ fn run_history(limit: u32) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("  RUN ID                 APPLICATION              EVENTS   STARTED AT");
-    println!("  --------------------------------------------------------------------------");
+    println!("  RUN ID                 APPLICATION              STATUS       EVENTS   STARTED AT");
+    println!("  -------------------------------------------------------------------------------");
 
     for run in runs {
         println!(
-            "  {:<22} {:<24} {:>6}   {}",
-            run.run_id, run.application, run.event_count, run.started_at_ms
+            "  {:<22} {:<24} {:<12} {:>6}   {}",
+            run.run_id, run.application, run.status, run.event_count, run.started_at_ms
         );
     }
 

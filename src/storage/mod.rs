@@ -53,6 +53,7 @@ pub struct RunSummary {
     pub application: String,
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
+    pub status: String,
     pub event_count: i64,
 }
 
@@ -76,6 +77,7 @@ pub struct StoredRun {
     pub application: String,
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
+    pub status: String,
     pub schema_version: String,
     pub passport: RuntimePassport,
     pub events: Vec<StoredEvent>,
@@ -126,7 +128,37 @@ pub fn open_default() -> Result<(Connection, PathBuf), StorageError> {
 pub fn initialize(path: &str) -> Result<Connection, StorageError> {
     let connection = Connection::open(path)?;
     connection.execute_batch(include_str!("../../schema/tracefact.sql"))?;
+    migrate_run_status(&connection)?;
     Ok(connection)
+}
+
+/// Adds lifecycle status to databases created by earlier TraceFact versions.
+/// Legacy rows are classified from their end timestamp rather than being
+/// mislabeled as healthy completed runs.
+fn migrate_run_status(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(runs)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_status = false;
+    for column in columns {
+        if column? == "status" {
+            has_status = true;
+            break;
+        }
+    }
+    drop(statement);
+
+    if !has_status {
+        connection.execute_batch(
+            "ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'interrupted'
+             CHECK (status IN ('running', 'completed', 'interrupted', 'failed'));
+             UPDATE runs SET status = CASE
+                 WHEN ended_at_ms IS NULL THEN 'interrupted'
+                 ELSE 'completed'
+             END;",
+        )?;
+    }
+
+    Ok(())
 }
 
 pub fn begin_run(
@@ -134,17 +166,33 @@ pub fn begin_run(
     snapshot: &RuntimeSnapshot,
     passport: &RuntimePassport,
 ) -> Result<(), StorageError> {
+    begin_run_with_events(connection, snapshot, passport, &[])
+}
+
+/// Creates a run, its initial passport, and bootstrap events in one transaction.
+/// A failed bootstrap therefore cannot leave a partially initialized run behind.
+pub fn begin_run_with_events(
+    connection: &mut Connection,
+    snapshot: &RuntimeSnapshot,
+    passport: &RuntimePassport,
+    initial_events: &[RuntimeEvent],
+) -> Result<(), StorageError> {
     let transaction = connection.transaction()?;
 
     transaction.execute(
-        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             &snapshot.snapshot_id,
             &snapshot.application,
             snapshot.started_at_ms,
             snapshot.ended_at_ms,
             &snapshot.schema_version,
+            if snapshot.ended_at_ms.is_some() {
+                "completed"
+            } else {
+                "running"
+            },
         ],
     )?;
 
@@ -159,6 +207,10 @@ pub fn begin_run(
             passport_json,
         ],
     )?;
+
+    for event in initial_events {
+        insert_event(&transaction, &snapshot.snapshot_id, event)?;
+    }
 
     transaction.commit()?;
     Ok(())
@@ -181,11 +233,27 @@ pub fn finish_run(
     ended_at_ms: i64,
     passport: &RuntimePassport,
 ) -> Result<(), StorageError> {
+    finish_run_with_status(connection, run_id, ended_at_ms, passport, "completed")
+}
+
+pub fn finish_run_with_status(
+    connection: &mut Connection,
+    run_id: &str,
+    ended_at_ms: i64,
+    passport: &RuntimePassport,
+    status: &str,
+) -> Result<(), StorageError> {
+    if !matches!(status, "completed" | "interrupted" | "failed") {
+        return Err(StorageError::InvalidValue(format!(
+            "unsupported terminal run status: {status}"
+        )));
+    }
+
     let transaction = connection.transaction()?;
 
     let updated = transaction.execute(
-        "UPDATE runs SET ended_at_ms = ?1 WHERE run_id = ?2",
-        params![ended_at_ms, run_id],
+        "UPDATE runs SET ended_at_ms = ?1, status = ?2 WHERE run_id = ?3",
+        params![ended_at_ms, status, run_id],
     )?;
 
     if updated != 1 {
@@ -226,14 +294,19 @@ pub fn save_snapshot_and_passport(
     let transaction = connection.transaction()?;
 
     transaction.execute(
-        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             &snapshot.snapshot_id,
             &snapshot.application,
             snapshot.started_at_ms,
             snapshot.ended_at_ms,
             &snapshot.schema_version,
+            if snapshot.ended_at_ms.is_some() {
+                "completed"
+            } else {
+                "running"
+            },
         ],
     )?;
 
@@ -301,7 +374,7 @@ fn insert_event(
 pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun>, StorageError> {
     let run = connection
         .query_row(
-            "SELECT run_id, application, started_at_ms, ended_at_ms, schema_version FROM runs WHERE run_id = ?1",
+            "SELECT run_id, application, started_at_ms, ended_at_ms, schema_version, status FROM runs WHERE run_id = ?1",
             params![run_id],
             |row| {
                 Ok((
@@ -310,12 +383,14 @@ pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((run_id, application, started_at_ms, ended_at_ms, schema_version)) = run else {
+    let Some((run_id, application, started_at_ms, ended_at_ms, schema_version, status)) = run
+    else {
         return Ok(None);
     };
 
@@ -355,6 +430,7 @@ pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun
         application,
         started_at_ms,
         ended_at_ms,
+        status,
         schema_version,
         passport,
         events,
@@ -378,10 +454,11 @@ pub fn list_runs(connection: &Connection, limit: u32) -> Result<Vec<RunSummary>,
                 r.application,
                 r.started_at_ms,
                 r.ended_at_ms,
+                r.status,
                 COUNT(e.event_id) AS event_count
            FROM runs r
            LEFT JOIN events e ON e.run_id = r.run_id
-          GROUP BY r.run_id, r.application, r.started_at_ms, r.ended_at_ms
+          GROUP BY r.run_id, r.application, r.started_at_ms, r.ended_at_ms, r.status
           ORDER BY r.started_at_ms DESC
           LIMIT ?1",
     )?;
@@ -392,7 +469,8 @@ pub fn list_runs(connection: &Connection, limit: u32) -> Result<Vec<RunSummary>,
             application: row.get(1)?,
             started_at_ms: row.get(2)?,
             ended_at_ms: row.get(3)?,
-            event_count: row.get(4)?,
+            status: row.get(4)?,
+            event_count: row.get(5)?,
         })
     })?;
 
@@ -422,6 +500,44 @@ fn home_dir() -> Result<PathBuf, StorageError> {
 mod tests {
     use super::*;
     use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
+
+    #[test]
+    fn legacy_run_status_migration_marks_open_runs_interrupted() {
+        let connection = Connection::open_in_memory().expect("database should initialize");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (
+                 run_id TEXT PRIMARY KEY,
+                 application TEXT NOT NULL,
+                 started_at_ms INTEGER NOT NULL,
+                 ended_at_ms INTEGER,
+                 schema_version TEXT NOT NULL
+             );
+             INSERT INTO runs VALUES ('old-complete', 'demo.exe', 1, 2, '0.1');
+             INSERT INTO runs VALUES ('old-open', 'demo.exe', 3, NULL, '0.1');",
+            )
+            .expect("legacy schema should be created");
+
+        migrate_run_status(&connection).expect("status migration should succeed");
+        let completed: String = connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'old-complete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("completed legacy status should be readable");
+        let interrupted: String = connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'old-open'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("open legacy status should be readable");
+
+        assert_eq!(completed, "completed");
+        assert_eq!(interrupted, "interrupted");
+        migrate_run_status(&connection).expect("running the migration again should be safe");
+    }
 
     #[test]
     fn save_and_list_round_trip() {
@@ -469,6 +585,7 @@ mod tests {
         assert_eq!(runs[0].run_id, "snap-test");
         assert_eq!(runs[0].application, "demo.exe");
         assert_eq!(runs[0].event_count, 1);
+        assert_eq!(runs[0].status, "completed");
     }
     #[test]
     fn get_run_returns_passport_and_events() {
@@ -516,6 +633,101 @@ mod tests {
         assert_eq!(stored.passport.passport_id, "passport-snap-inspect");
         assert_eq!(stored.events.len(), 1);
         assert_eq!(stored.events[0].event_id, "event-inspect");
+    }
+
+    #[test]
+    fn begin_run_with_events_saves_bootstrap_events_atomically() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        let snapshot = RuntimeSnapshot {
+            schema_version: "0.1".into(),
+            snapshot_id: "watch-bootstrap-test".into(),
+            application: "demo.exe".into(),
+            started_at_ms: 1000,
+            ended_at_ms: None,
+            events: vec![],
+        };
+        let passport = RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: "passport-watch-bootstrap-test".into(),
+            generated_at_ms: 1000,
+            application: "demo.exe".into(),
+            observations: Default::default(),
+            changes: vec![],
+        };
+        let event = RuntimeEvent {
+            id: "watch-bootstrap-event-1".into(),
+            timestamp_ms: 1000,
+            event_type: EventType::ProcessObserved,
+            process: ProcessIdentity {
+                pid: 42,
+                executable: "demo.exe".into(),
+                command_line: None,
+                parent_pid: Some(1),
+            },
+            subject: "process".into(),
+            target: Some("demo.exe".into()),
+            metadata: serde_json::json!({"observation": "bootstrap"}),
+            source: "test".into(),
+            sensitivity: Sensitivity::SystemMetadata,
+        };
+
+        begin_run_with_events(&mut connection, &snapshot, &passport, &[event])
+            .expect("run and bootstrap event should be saved");
+
+        let stored = get_run(&connection, "watch-bootstrap-test")
+            .expect("run should be readable")
+            .expect("run should exist");
+        assert_eq!(stored.events.len(), 1);
+        assert_eq!(stored.events[0].event_id, "watch-bootstrap-event-1");
+        assert_eq!(stored.ended_at_ms, None);
+    }
+
+    #[test]
+    fn begin_run_with_events_rolls_back_if_bootstrap_event_fails() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        let snapshot = RuntimeSnapshot {
+            schema_version: "0.1".into(),
+            snapshot_id: "watch-bootstrap-rollback-test".into(),
+            application: "demo.exe".into(),
+            started_at_ms: 1000,
+            ended_at_ms: None,
+            events: vec![],
+        };
+        let passport = RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: "passport-watch-bootstrap-rollback-test".into(),
+            generated_at_ms: 1000,
+            application: "demo.exe".into(),
+            observations: Default::default(),
+            changes: vec![],
+        };
+        let event = RuntimeEvent {
+            id: "duplicate-bootstrap-event".into(),
+            timestamp_ms: 1000,
+            event_type: EventType::ProcessObserved,
+            process: ProcessIdentity {
+                pid: 42,
+                executable: "demo.exe".into(),
+                command_line: None,
+                parent_pid: Some(1),
+            },
+            subject: "process".into(),
+            target: Some("demo.exe".into()),
+            metadata: serde_json::json!({"observation": "bootstrap"}),
+            source: "test".into(),
+            sensitivity: Sensitivity::SystemMetadata,
+        };
+
+        let result = begin_run_with_events(
+            &mut connection,
+            &snapshot,
+            &passport,
+            &[event.clone(), event],
+        );
+        assert!(result.is_err());
+        assert!(get_run(&connection, "watch-bootstrap-rollback-test")
+            .expect("database should remain readable")
+            .is_none());
     }
 
     #[test]
@@ -581,10 +793,52 @@ mod tests {
             .expect("run should exist");
 
         assert_eq!(stored.ended_at_ms, Some(2000));
+        assert_eq!(stored.status, "completed");
         assert_eq!(stored.events.len(), 1);
         assert_eq!(stored.events[0].event_id, "watch-event-1");
         assert_eq!(stored.passport.generated_at_ms, 2000);
         assert_eq!(stored.passport.observations.processes, vec!["child.exe"]);
+    }
+
+    #[test]
+    fn finish_run_with_status_preserves_failure_state() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        let snapshot = RuntimeSnapshot {
+            schema_version: "0.1".into(),
+            snapshot_id: "watch-failed-test".into(),
+            application: "demo.exe".into(),
+            started_at_ms: 1000,
+            ended_at_ms: None,
+            events: vec![],
+        };
+        let initial_passport = RuntimePassport {
+            schema_version: "0.1".into(),
+            passport_id: "passport-watch-failed-test".into(),
+            generated_at_ms: 1000,
+            application: "demo.exe".into(),
+            observations: Default::default(),
+            changes: vec![],
+        };
+        begin_run(&mut connection, &snapshot, &initial_passport).expect("run should be created");
+
+        let final_passport = RuntimePassport {
+            generated_at_ms: 1500,
+            ..initial_passport
+        };
+        finish_run_with_status(
+            &mut connection,
+            "watch-failed-test",
+            1500,
+            &final_passport,
+            "failed",
+        )
+        .expect("failed run should be finalized");
+
+        let stored = get_run(&connection, "watch-failed-test")
+            .expect("run should be readable")
+            .expect("run should exist");
+        assert_eq!(stored.status, "failed");
+        assert_eq!(stored.ended_at_ms, Some(1500));
     }
 
     #[test]
