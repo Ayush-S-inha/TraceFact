@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceFact Evidence Bundle",
+  "type": "object",
+  "required": [
+    "bundle_schema_version",
+    "exported_at_ms",
+    "run",
+    "scope",
+    "coverage",
+    "passport",
+    "events"
+  ],
+  "properties": {
+    "bundle_schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "exported_at_ms": {
+      "type": "integer"
+    },
+    "run": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "application",
+        "started_at_ms",
+        "ended_at_ms",
+        "status",
+        "schema_version"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "application": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "type": "integer"
+        },
+        "ended_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "running",
+            "completed",
+            "interrupted",
+            "failed"
+          ]
+        },
+        "schema_version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "platform",
+        "kind",
+        "root_pid",
+        "includes_descendants"
+      ],
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "selected_process_tree_snapshot",
+            "selected_process_tree_watch",
+            "unknown"
+          ]
+        },
+        "root_pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "includes_descendants": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "event_count",
+        "event_counts_by_type",
+        "collector_sources",
+        "limitations"
+      ],
+      "properties": {
+        "event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_counts_by_type": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "collector_sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "passport": {
+      "$ref": "runtime_passport.schema.json"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "timestamp_ms",
+          "event_type",
+          "pid",
+          "executable",
+          "subject",
+          "target",
+          "metadata",
+          "source",
+          "sensitivity"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string"
+          },
+          "timestamp_ms": {
+            "type": "integer"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "executable": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "source": {
+            "type": "string"
+          },
+          "sensitivity": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

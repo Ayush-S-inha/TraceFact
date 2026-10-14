@@ -20,6 +20,8 @@ The first hardening pass keeps diagnostic samples free of process IDs and endpoi
 
 Watch runs now have a persisted lifecycle status. Bootstrap events are inserted atomically with the run record, watch-loop errors are captured for shutdown, and the network observer is stopped before a final queue drain and passport update are attempted. Ctrl+C drains queued process events up to a fixed limit and reports when that limit is exceeded. The WMI process notification iterators still do not have a cooperative cancellation path in this checkpoint, so a clean cross-collector shutdown has not yet been fully verified.
 
+The Part 3 implementation checkpoint adds SQLite schema versioning using `PRAGMA user_version`, an ordered migration directory, and a standalone JSON evidence export command. Exported evidence preserves run status, inferred observation scope, collector provenance, structured event metadata, and explicit coverage limitations. The evidence schema and cross-platform database locations are documented. Windows formatting, tests, export validation, and live regression checks still need to pass before this checkpoint is considered verified.
+
 ## Build order
 
 1. Event schema

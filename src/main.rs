@@ -32,6 +32,7 @@ fn print_help() {
     println!("  tracefact history");
     println!("  tracefact inspect <run_id>");
     println!("  tracefact inspect latest");
+    println!("  tracefact export <run_id|latest> <path.json>");
     println!("  tracefact help");
     println!();
     println!(
@@ -973,6 +974,76 @@ fn run_inspect(run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_export(run_id: &str, output_path: &str) -> Result<(), String> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    let (connection, database_path) = storage::open_default().map_err(|error| error.to_string())?;
+    let resolved_run_id = if run_id == "latest" {
+        storage::latest_run_id(&connection)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "No saved runs were found.".to_string())?
+    } else {
+        run_id.to_string()
+    };
+
+    let run = storage::get_run(&connection, &resolved_run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Run {resolved_run_id} was not found."))?;
+
+    if run.status == "running" {
+        return Err(format!(
+            "Run {} is still running. Stop or finalize it before exporting evidence.",
+            run.run_id
+        ));
+    }
+
+    let exported_at_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("System clock is before the Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "Export timestamp is outside the supported range.".to_string())?;
+
+    let bundle = analysis::evidence_bundle_from_run(&run, exported_at_ms)?;
+    let json = serde_json::to_vec_pretty(&bundle)
+        .map_err(|error| format!("Could not serialize evidence bundle: {error}"))?;
+    let path = std::path::Path::new(output_path);
+
+    // Never overwrite an existing evidence file without an explicit user action.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "Could not create export at {} (existing files are not overwritten): {error}",
+                path.display()
+            )
+        })?;
+
+    if let Err(error) = file.write_all(&json).and_then(|_| file.write_all(b"\n")) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("Could not write evidence bundle: {error}"));
+    }
+
+    println!("TraceFact evidence export");
+    println!();
+    println!("  Run ID:          {}", run.run_id);
+    println!("  Application:     {}", run.application);
+    println!("  Run status:      {}", run.status);
+    println!("  Events:          {}", bundle.coverage.event_count);
+    println!("  Database:        {}", database_path.display());
+    println!("  Exported to:     {}", path.display());
+    println!();
+    println!("Review the exported file before sharing it. Event metadata may contain process IDs,");
+    println!(
+        "executable names, and network endpoints. Raw application payloads are not collected."
+    );
+    Ok(())
+}
+
 fn run_history(limit: u32) -> Result<(), String> {
     let (connection, database_path) = storage::open_default().map_err(|error| error.to_string())?;
     let runs = storage::list_runs(&connection, limit).map_err(|error| error.to_string())?;
@@ -1074,6 +1145,19 @@ fn main() -> ExitCode {
             },
             None => {
                 eprintln!("Usage: tracefact inspect <run_id|latest>");
+                ExitCode::FAILURE
+            }
+        },
+        Some("export") => match (args.next(), args.next()) {
+            (Some(run_id), Some(path)) => match run_export(&run_id, &path) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("TraceFact could not export evidence: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
+                eprintln!("Usage: tracefact export <run_id|latest> <path.json>");
                 ExitCode::FAILURE
             }
         },

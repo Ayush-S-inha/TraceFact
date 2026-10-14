@@ -125,11 +125,39 @@ pub fn open_default() -> Result<(Connection, PathBuf), StorageError> {
     Ok((connection, path))
 }
 
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 pub fn initialize(path: &str) -> Result<Connection, StorageError> {
-    let connection = Connection::open(path)?;
-    connection.execute_batch(include_str!("../../schema/tracefact.sql"))?;
-    migrate_run_status(&connection)?;
+    let mut connection = Connection::open(path)?;
+    // Enable referential integrity before beginning migrations.
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    apply_migrations(&mut connection)?;
     Ok(connection)
+}
+
+/// Applies ordered schema migrations using SQLite's PRAGMA user_version.
+/// Each migration and the corresponding version update are committed atomically.
+fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
+    let current_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+    if current_version > CURRENT_SCHEMA_VERSION {
+        return Err(StorageError::InvalidValue(format!(
+            "database schema version {current_version} is newer than this TraceFact build supports (maximum {CURRENT_SCHEMA_VERSION})"
+        )));
+    }
+
+    if current_version < 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(include_str!("../../schema/migrations/0001_initial.sql"))?;
+        // Earlier TraceFact builds did not consistently track the SQLite schema version.
+        // This migration also upgrades the legacy runs table when it lacks status.
+        migrate_run_status(&transaction)?;
+        transaction.execute_batch("PRAGMA user_version = 1;")?;
+        transaction.commit()?;
+    }
+
+    Ok(())
 }
 
 /// Adds lifecycle status to databases created by earlier TraceFact versions.
@@ -500,6 +528,76 @@ fn home_dir() -> Result<PathBuf, StorageError> {
 mod tests {
     use super::*;
     use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
+
+    #[test]
+    fn initialize_applies_versioned_schema_migration() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        apply_migrations(&mut connection).expect("schema migration should succeed");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should be readable");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // Migration is idempotent after the version has advanced.
+        apply_migrations(&mut connection).expect("migration should be safe to rerun");
+        let version_again: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should remain readable");
+        assert_eq!(version_again, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn versioned_migration_upgrades_legacy_runs_table() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (
+                 run_id TEXT PRIMARY KEY,
+                 application TEXT NOT NULL,
+                 started_at_ms INTEGER NOT NULL,
+                 ended_at_ms INTEGER,
+                 schema_version TEXT NOT NULL
+             );
+             INSERT INTO runs VALUES ('legacy-complete', 'demo.exe', 1, 2, '0.1');
+             INSERT INTO runs VALUES ('legacy-open', 'demo.exe', 3, NULL, '0.1');",
+            )
+            .expect("legacy schema should be created");
+
+        apply_migrations(&mut connection).expect("legacy database should migrate");
+        let complete: String = connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'legacy-complete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy completed status should be readable");
+        let open: String = connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'legacy-open'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy open status should be readable");
+        assert_eq!(complete, "completed");
+        assert_eq!(open, "interrupted");
+
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should be readable");
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn newer_schema_version_is_rejected() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch("PRAGMA user_version = 999;")
+            .unwrap();
+        let error = apply_migrations(&mut connection).expect_err("newer schema must be rejected");
+        assert!(error
+            .to_string()
+            .contains("newer than this TraceFact build supports"));
+    }
 
     #[test]
     fn legacy_run_status_migration_marks_open_runs_interrupted() {

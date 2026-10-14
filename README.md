@@ -41,9 +41,10 @@ tracefact process <pid>
 tracefact watch <pid>
 tracefact history
 tracefact inspect latest
+tracefact export latest tracefact-evidence.json
 ```
 
-The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
+The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. The export command writes a standalone JSON evidence bundle for a finalized run. It refuses to overwrite an existing path. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
 
 The Windows process watcher and TCP observer should be run from an Administrator PowerShell. Windows can reject WMI event subscriptions or kernel network tracing when the process lacks the required permissions. A network tracing session can also fail if another kernel tracing session is already active.
 
@@ -51,7 +52,7 @@ The Windows process watcher and TCP observer should be run from an Administrator
 
 TraceFact is designed to keep its data on the user's machine. It does not need an account, cloud service, API key, or telemetry. Raw payloads are off by default. The default scope is a process or application selected by the user, not the whole computer.
 
-Sensitive values should be filtered at collection time rather than being saved and cleaned up later.
+Sensitive values should be filtered at collection time rather than being saved and cleaned up later. An exported evidence file can include process IDs, executable names, and network endpoints; review it before sharing. Missing events are not evidence that a behavior did not occur.
 
 ## Resource use
 

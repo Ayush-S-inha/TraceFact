@@ -52,13 +52,20 @@ Make watch startup, stop, finalization, and cleanup predictable. Ensure a run is
 
 ### Part 3: Evidence and persistence foundations
 
-Stabilize the event contract and database migrations. Preserve timestamps, process identity, source, sensitivity, and structured metadata. Add useful query paths and exportable evidence bundles without introducing hidden data collection.
+Stabilize database schema evolution and make saved run evidence portable. Preserve timestamps, process identity, source, sensitivity, and structured metadata. Export evidence without introducing hidden data collection.
+
+**Part 3 checkpoint**
+- SQLite schema evolution uses `PRAGMA user_version` and an ordered, transactional migration directory.
+- Legacy databases are upgraded without falsely marking unfinished runs as completed.
+- `tracefact export <run_id|latest> <path.json>` writes a standalone JSON evidence bundle, refuses to overwrite files, and includes run status, inferred scope, collector provenance, structured events, the Runtime Passport, and explicit coverage limitations.
+- A JSON Schema is provided for exported evidence.
+- Database locations and export privacy implications are documented for Windows, macOS, and Linux.
 
 **Acceptance criteria**
 - Schema migrations are versioned and tested.
-- Every stored event belongs to a known run and retains its collector provenance.
+- Every exported event retains its stored collector provenance and metadata.
 - Exported evidence can be validated independently of the live UI.
-- Database and export paths are documented for each supported operating system.
+- Exported files are not silently overwritten and incomplete coverage is not represented as absence of behavior.
 
 ### Part 4: Runtime Passport and baseline management
 
