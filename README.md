@@ -42,7 +42,13 @@ tracefact watch <pid>
 tracefact history
 tracefact inspect latest
 tracefact export latest tracefact-evidence.json
+tracefact baseline save "desktop stable" latest
+tracefact baseline list
+tracefact baseline inspect "desktop stable"
+tracefact baseline export "desktop stable" desktop-baseline.json
 ```
+
+Named Runtime Passport baselines can be saved from completed runs. Baselines retain their source run, observation scope, and coverage limitations. Names are unique without regard to case; saving an existing name fails rather than replacing it.
 
 The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. The export command writes a standalone JSON evidence bundle for a finalized run. It refuses to overwrite an existing path. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
 

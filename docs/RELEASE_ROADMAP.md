@@ -69,12 +69,19 @@ Stabilize database schema evolution and make saved run evidence portable. Preser
 
 ### Part 4: Runtime Passport and baseline management
 
-Define a versioned Runtime Passport that describes observed processes, network peers, files, and runtime dependencies. Capture a named baseline and preserve the observation scope and coverage information that qualify it.
+The first baseline-management pass adds named Runtime Passport baselines from completed saved runs. Baselines are kept in SQLite, retain their source run ID, and carry the observation scope and collection limitations that qualify the Passport. Names are unique case-insensitively, and an existing baseline is never silently replaced.
 
-**Acceptance criteria**
-- A baseline can be named, stored, inspected, and exported.
-- Passport fields have stable meanings and schema validation.
-- Incomplete collector coverage is explicitly represented.
+**Implemented in this checkpoint**
+- Save, list, inspect, and export commands for named baselines.
+- A version 2 SQLite migration for baseline storage.
+- A versioned baseline JSON Schema referencing the Runtime Passport schema.
+- Stable ordering and duplicate removal for Passport observation lists when a baseline is captured.
+- Explicit source-run, scope, collector, and coverage metadata.
+
+**Still to verify**
+- Run the Part 4 Rust test suite and CLI scenarios on Windows.
+- Exercise migration 1 to 2 against a copy of a real Part 3 database.
+- Baseline comparison and drift findings are Part 5, not part of this checkpoint.
 
 ### Part 5: Behavior comparison and drift detection
 

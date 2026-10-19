@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::model::{
     BehaviorChange, ChangeKind, EventType, EvidenceBundle, EvidenceCoverage, EvidenceEvent,
     EvidenceRunMetadata, EvidenceScope, PassportObservations, RuntimeEvent, RuntimePassport,
-    RuntimeSnapshot,
+    RuntimePassportBaseline, RuntimeSnapshot,
 };
 use crate::storage::StoredRun;
 
@@ -266,6 +266,55 @@ pub fn evidence_bundle_from_run(
     })
 }
 
+/// Creates a named baseline from a completed saved run.
+/// Observation lists are normalized so later comparisons do not depend on vector order.
+pub fn baseline_from_run(
+    run: &StoredRun,
+    name: &str,
+    created_at_ms: i64,
+) -> Result<RuntimePassportBaseline, String> {
+    crate::storage::validate_baseline_name(name).map_err(|error| error.to_string())?;
+    if run.status != "completed" || run.ended_at_ms.is_none() {
+        return Err(format!(
+            "Run {} is not a completed run; only completed runs can become baselines.",
+            run.run_id
+        ));
+    }
+
+    // Reuse the evidence builder so baseline scope and coverage carry the same limitations.
+    let evidence = evidence_bundle_from_run(run, created_at_ms)?;
+    let mut passport = run.passport.clone();
+    passport.observations.processes.sort();
+    passport.observations.processes.dedup();
+    passport.observations.network_targets.sort();
+    passport.observations.network_targets.dedup();
+    passport.observations.files.sort();
+    passport.observations.files.dedup();
+    passport.observations.libraries.sort();
+    passport.observations.libraries.dedup();
+    // A baseline captures observations, not a previous comparison's findings.
+    passport.changes.clear();
+
+    let mut coverage = evidence.coverage;
+    if run.events.is_empty() {
+        coverage.limitations.push(
+            "No events were stored for the source run; the baseline may contain limited observations."
+                .to_string(),
+        );
+    }
+
+    Ok(RuntimePassportBaseline {
+        baseline_schema_version: "1.0".to_string(),
+        name: name.to_string(),
+        created_at_ms,
+        source_run_id: run.run_id.clone(),
+        application: run.application.clone(),
+        passport,
+        scope: evidence.scope,
+        coverage,
+    })
+}
+
 #[cfg(test)]
 mod evidence_bundle_tests {
     use super::evidence_bundle_from_run;
@@ -364,6 +413,46 @@ mod evidence_bundle_tests {
         run.events[0].metadata_json = "{not valid JSON".to_string();
         let error = evidence_bundle_from_run(&run, 300).expect_err("invalid metadata must fail");
         assert!(error.contains("invalid metadata JSON"));
+    }
+
+    #[test]
+    fn baseline_normalizes_observations_and_clears_old_changes() {
+        let mut run = sample_run("completed");
+        run.passport.observations.processes = vec![
+            "z.exe".to_string(),
+            "a.exe".to_string(),
+            "a.exe".to_string(),
+        ];
+        run.passport.changes.push(crate::model::BehaviorChange {
+            kind: crate::model::ChangeKind::Added,
+            category: "process".to_string(),
+            subject: "old-finding.exe".to_string(),
+            reason: "test finding".to_string(),
+        });
+        let baseline = super::baseline_from_run(&run, "test baseline", 300)
+            .expect("completed run should become a baseline");
+
+        assert_eq!(baseline.name, "test baseline");
+        assert_eq!(baseline.source_run_id, run.run_id);
+        assert_eq!(
+            baseline.passport.observations.processes,
+            vec!["a.exe".to_string(), "z.exe".to_string()]
+        );
+        assert!(baseline.passport.changes.is_empty());
+        assert_eq!(baseline.coverage.event_count, 2);
+        assert!(baseline
+            .coverage
+            .limitations
+            .iter()
+            .any(|item| item.contains("not implemented")));
+    }
+
+    #[test]
+    fn baseline_rejects_incomplete_runs() {
+        let run = sample_run("interrupted");
+        let error = super::baseline_from_run(&run, "test baseline", 300)
+            .expect_err("interrupted runs must not become baselines");
+        assert!(error.contains("only completed runs"));
     }
 
     #[test]

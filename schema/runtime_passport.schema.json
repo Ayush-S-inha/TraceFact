@@ -5,19 +5,34 @@
   "required": ["schema_version", "passport_id", "generated_at_ms", "application", "observations", "changes"],
   "properties": {
     "schema_version": {"type": "string"},
-    "passport_id": {"type": "string"},
+    "passport_id": {"type": "string", "minLength": 1},
     "generated_at_ms": {"type": "integer"},
-    "application": {"type": "string"},
+    "application": {"type": "string", "minLength": 1},
     "observations": {
       "type": "object",
       "required": ["processes", "network_targets", "files", "libraries"],
       "properties": {
-        "processes": {"type": "array", "items": {"type": "string"}},
-        "network_targets": {"type": "array", "items": {"type": "string"}},
-        "files": {"type": "array", "items": {"type": "string"}},
-        "libraries": {"type": "array", "items": {"type": "string"}}
-      }
+        "processes": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "network_targets": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "files": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "libraries": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": false
     },
-    "changes": {"type": "array"}
-  }
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "category", "subject", "reason"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["Added", "Removed", "Changed"]},
+          "category": {"type": "string"},
+          "subject": {"type": "string"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
 }

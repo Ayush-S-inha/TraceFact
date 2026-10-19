@@ -115,7 +115,10 @@ pub struct EvidenceScope {
     pub platform: String,
     /// "selected_process_tree_snapshot", "selected_process_tree_watch", or "unknown".
     pub kind: String,
+    /// The root PID when it can be recovered from stored metadata.
     pub root_pid: Option<u32>,
+    /// Whether the collector scope is intended to include descendants. This does not
+    /// prove that descendants existed or that all descendants were observed.
     pub includes_descendants: bool,
 }
 
@@ -127,6 +130,19 @@ pub struct EvidenceCoverage {
     pub limitations: Vec<String>,
 }
 
+/// A named, local baseline captured from a finalized Runtime Passport.
+/// `name` is the user-facing identity and is unique case-insensitively in local storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePassportBaseline {
+    pub baseline_schema_version: String,
+    pub name: String,
+    pub created_at_ms: i64,
+    pub source_run_id: String,
+    pub application: String,
+    pub passport: RuntimePassport,
+    pub scope: EvidenceScope,
+    pub coverage: EvidenceCoverage,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceEvent {
     pub event_id: String,

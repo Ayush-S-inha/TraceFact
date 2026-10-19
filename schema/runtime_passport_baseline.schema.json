@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceFact Runtime Passport Baseline",
+  "type": "object",
+  "required": [
+    "baseline_schema_version",
+    "name",
+    "created_at_ms",
+    "source_run_id",
+    "application",
+    "passport",
+    "scope",
+    "coverage"
+  ],
+  "properties": {
+    "baseline_schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "created_at_ms": {
+      "type": "integer"
+    },
+    "source_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "application": {
+      "type": "string",
+      "minLength": 1
+    },
+    "passport": {
+      "$ref": "runtime_passport.schema.json"
+    },
+    "scope": {
+      "type": "object",
+      "required": ["platform", "kind", "root_pid", "includes_descendants"],
+      "properties": {
+        "platform": {"type": "string"},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "selected_process_tree_snapshot",
+            "selected_process_tree_watch",
+            "unknown"
+          ]
+        },
+        "root_pid": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "includes_descendants": {
+          "type": "boolean",
+          "description": "Whether the selected collector scope is intended to include descendants; this is not proof that descendants existed or were observed."
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "event_count",
+        "event_counts_by_type",
+        "collector_sources",
+        "limitations"
+      ],
+      "properties": {
+        "event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_counts_by_type": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "collector_sources": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

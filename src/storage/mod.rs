@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::model::{RuntimeEvent, RuntimePassport, RuntimeSnapshot};
+use crate::model::{
+    EvidenceCoverage, EvidenceScope, RuntimeEvent, RuntimePassport, RuntimePassportBaseline,
+    RuntimeSnapshot,
+};
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -83,6 +86,16 @@ pub struct StoredRun {
     pub events: Vec<StoredEvent>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BaselineSummary {
+    pub name: String,
+    pub application: String,
+    pub created_at_ms: i64,
+    pub source_run_id: String,
+    pub event_count: u64,
+    pub collector_sources: Vec<String>,
+}
+
 pub fn default_database_path() -> Result<PathBuf, StorageError> {
     #[cfg(windows)]
     {
@@ -125,7 +138,7 @@ pub fn open_default() -> Result<(Connection, PathBuf), StorageError> {
     Ok((connection, path))
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub fn initialize(path: &str) -> Result<Connection, StorageError> {
     let mut connection = Connection::open(path)?;
@@ -138,7 +151,7 @@ pub fn initialize(path: &str) -> Result<Connection, StorageError> {
 /// Applies ordered schema migrations using SQLite's PRAGMA user_version.
 /// Each migration and the corresponding version update are committed atomically.
 fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
-    let current_version: i64 =
+    let mut current_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
     if current_version > CURRENT_SCHEMA_VERSION {
@@ -154,6 +167,16 @@ fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
         // This migration also upgrades the legacy runs table when it lacks status.
         migrate_run_status(&transaction)?;
         transaction.execute_batch("PRAGMA user_version = 1;")?;
+        transaction.commit()?;
+        current_version = 1;
+    }
+
+    if current_version < 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(include_str!(
+            "../../schema/migrations/0002_named_baselines.sql"
+        ))?;
+        transaction.execute_batch("PRAGMA user_version = 2;")?;
         transaction.commit()?;
     }
 
@@ -465,6 +488,185 @@ pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun
     }))
 }
 
+/// Validates the user-facing baseline name before storage or export.
+pub fn validate_baseline_name(name: &str) -> Result<(), StorageError> {
+    let length = name.chars().count();
+    if name.trim().is_empty() {
+        return Err(StorageError::InvalidValue(
+            "baseline name must not be empty".to_string(),
+        ));
+    }
+    if name.trim() != name {
+        return Err(StorageError::InvalidValue(
+            "baseline name must not start or end with whitespace".to_string(),
+        ));
+    }
+    if length > 120 {
+        return Err(StorageError::InvalidValue(
+            "baseline name must be 120 characters or fewer".to_string(),
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(StorageError::InvalidValue(
+            "baseline name must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn baseline_name_key(name: &str) -> String {
+    // SQLite's built-in NOCASE collation folds ASCII only. Store a Unicode-lowercase
+    // key so case variants in non-ASCII names are also treated as the same baseline.
+    name.to_lowercase()
+}
+
+pub fn save_baseline(
+    connection: &mut Connection,
+    baseline: &RuntimePassportBaseline,
+) -> Result<(), StorageError> {
+    validate_baseline_name(&baseline.name)?;
+    if baseline.baseline_schema_version != "1.0" {
+        return Err(StorageError::InvalidValue(format!(
+            "unsupported baseline schema version '{}'",
+            baseline.baseline_schema_version
+        )));
+    }
+
+    let name_key = baseline_name_key(&baseline.name);
+    let transaction = connection.transaction()?;
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM baselines WHERE name_key = ?1)",
+        params![&name_key],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Err(StorageError::InvalidValue(format!(
+            "baseline '{}' already exists; existing baselines are not overwritten",
+            baseline.name
+        )));
+    }
+
+    transaction.execute(
+        "INSERT INTO baselines (
+            name, name_key, created_at_ms, application, source_run_id, baseline_schema_version,
+            passport_json, scope_json, coverage_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            &baseline.name,
+            &name_key,
+            baseline.created_at_ms,
+            &baseline.application,
+            &baseline.source_run_id,
+            &baseline.baseline_schema_version,
+            serde_json::to_string(&baseline.passport)?,
+            serde_json::to_string(&baseline.scope)?,
+            serde_json::to_string(&baseline.coverage)?,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn get_baseline(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<RuntimePassportBaseline>, StorageError> {
+    let stored = connection
+        .query_row(
+            "SELECT name, created_at_ms, application, source_run_id, baseline_schema_version,
+                    passport_json, scope_json, coverage_json
+               FROM baselines WHERE name_key = ?1",
+            params![baseline_name_key(name)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        name,
+        created_at_ms,
+        application,
+        source_run_id,
+        baseline_schema_version,
+        passport_json,
+        scope_json,
+        coverage_json,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(RuntimePassportBaseline {
+        baseline_schema_version,
+        name,
+        created_at_ms,
+        source_run_id,
+        application,
+        passport: serde_json::from_str(&passport_json)?,
+        scope: serde_json::from_str::<EvidenceScope>(&scope_json)?,
+        coverage: serde_json::from_str::<EvidenceCoverage>(&coverage_json)?,
+    }))
+}
+
+pub fn list_baselines(
+    connection: &Connection,
+    limit: u32,
+) -> Result<Vec<BaselineSummary>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT name, application, created_at_ms, source_run_id, coverage_json
+           FROM baselines
+          ORDER BY created_at_ms DESC, name COLLATE NOCASE ASC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut baselines = Vec::new();
+    for row in rows {
+        let (name, application, created_at_ms, source_run_id, coverage_json) = row?;
+        let coverage: EvidenceCoverage = serde_json::from_str(&coverage_json)?;
+        baselines.push(BaselineSummary {
+            name,
+            application,
+            created_at_ms,
+            source_run_id,
+            event_count: coverage.event_count,
+            collector_sources: coverage.collector_sources,
+        });
+    }
+    Ok(baselines)
+}
+
+pub fn latest_completed_run_id(connection: &Connection) -> Result<Option<String>, StorageError> {
+    connection
+        .query_row(
+            "SELECT run_id FROM runs
+              WHERE status = 'completed' AND ended_at_ms IS NOT NULL
+              ORDER BY started_at_ms DESC, run_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StorageError::from)
+}
+
 pub fn latest_run_id(connection: &Connection) -> Result<Option<String>, StorageError> {
     connection
         .query_row(
@@ -537,6 +739,14 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should be readable");
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let baseline_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'baselines'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("baseline table should exist");
+        assert_eq!(baseline_table_count, 1);
 
         // Migration is idempotent after the version has advanced.
         apply_migrations(&mut connection).expect("migration should be safe to rerun");
@@ -937,6 +1147,157 @@ mod tests {
             .expect("run should exist");
         assert_eq!(stored.status, "failed");
         assert_eq!(stored.ended_at_ms, Some(1500));
+    }
+
+    #[test]
+    fn version_one_database_receives_named_baseline_migration() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch(include_str!("../../schema/migrations/0001_initial.sql"))
+            .expect("version one schema should be created");
+        connection
+            .execute_batch(
+                "INSERT INTO runs VALUES ('pre-baseline-run', 'app.exe', 100, 200, '0.1', 'completed');
+                 INSERT INTO events VALUES ('pre-baseline-event', 'pre-baseline-run', 150, 'process_observed', 42, 'app.exe', 'process', 'app.exe', '{}', 'test-collector', 'SystemMetadata');
+                 INSERT INTO passports VALUES ('pre-baseline-passport', 'pre-baseline-run', 200, '{\"schema_version\":\"0.1\",\"passport_id\":\"pre-baseline-passport\",\"generated_at_ms\":200,\"application\":\"app.exe\",\"observations\":{\"processes\":[],\"network_targets\":[],\"files\":[],\"libraries\":[]},\"changes\":[]}');
+                 PRAGMA user_version = 1;",
+            )
+            .expect("version one data should be created");
+
+        apply_migrations(&mut connection).expect("version two migration should succeed");
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version should be readable");
+        assert_eq!(version, 2);
+        let baseline_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'baselines'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("baseline table should be readable");
+        assert_eq!(baseline_table_count, 1);
+        let preserved_runs: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE run_id = 'pre-baseline-run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("existing run should remain available");
+        let preserved_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = 'pre-baseline-event'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("existing event should remain available");
+        let preserved_passports: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM passports WHERE passport_id = 'pre-baseline-passport'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("existing Passport should remain available");
+        assert_eq!(preserved_runs, 1);
+        assert_eq!(preserved_events, 1);
+        assert_eq!(preserved_passports, 1);
+    }
+
+    #[test]
+    fn named_baseline_round_trips_and_rejects_duplicate_names() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute(
+            "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
+             VALUES ('source-run', 'demo.exe', 100, 200, '0.1', 'completed')",
+            [],
+        ).expect("source run should exist");
+        let baseline = RuntimePassportBaseline {
+            baseline_schema_version: "1.0".to_string(),
+            name: "desktop-app".to_string(),
+            created_at_ms: 300,
+            source_run_id: "source-run".to_string(),
+            application: "demo.exe".to_string(),
+            passport: RuntimePassport {
+                schema_version: "0.1".to_string(),
+                passport_id: "passport-source-run".to_string(),
+                generated_at_ms: 200,
+                application: "demo.exe".to_string(),
+                observations: Default::default(),
+                changes: vec![],
+            },
+            scope: EvidenceScope {
+                platform: "windows".to_string(),
+                kind: "selected_process_tree_watch".to_string(),
+                root_pid: Some(42),
+                includes_descendants: true,
+            },
+            coverage: EvidenceCoverage {
+                event_count: 2,
+                event_counts_by_type: std::collections::BTreeMap::from([(
+                    "process_observed".to_string(),
+                    2,
+                )]),
+                collector_sources: vec!["windows_process_watch".to_string()],
+                limitations: vec!["Not all runtime behavior is observable.".to_string()],
+            },
+        };
+
+        save_baseline(&mut connection, &baseline).expect("baseline should save");
+        let stored = get_baseline(&connection, "DESKTOP-APP")
+            .expect("baseline should be read")
+            .expect("baseline should exist case-insensitively");
+        assert_eq!(stored.name, "desktop-app");
+        assert_eq!(stored.source_run_id, "source-run");
+        assert_eq!(stored.coverage.event_count, 2);
+
+        let mut case_variant = baseline.clone();
+        case_variant.name = "DESKTOP-APP".to_string();
+        let error = save_baseline(&mut connection, &case_variant)
+            .expect_err("case-insensitive duplicate baseline must not overwrite");
+        assert!(error.to_string().contains("already exists"));
+
+        let summaries = list_baselines(&connection, 20).expect("baselines should list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "desktop-app");
+        assert_eq!(summaries[0].event_count, 2);
+
+        // SQLite NOCASE does not fold non-ASCII letters; the stored key must.
+        let mut unicode_baseline = baseline.clone();
+        unicode_baseline.name = "CAFÉ desktop".to_string();
+        save_baseline(&mut connection, &unicode_baseline)
+            .expect("Unicode baseline name should save");
+        let retrieved = get_baseline(&connection, "café desktop")
+            .expect("Unicode baseline lookup should work")
+            .expect("Unicode baseline should be found ignoring case");
+        assert_eq!(retrieved.name, "CAFÉ desktop");
+
+        unicode_baseline.name = "café desktop".to_string();
+        let error = save_baseline(&mut connection, &unicode_baseline)
+            .expect_err("Unicode case variants must not create duplicates");
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn baseline_names_are_validated() {
+        assert!(validate_baseline_name("stable baseline").is_ok());
+        assert!(validate_baseline_name("").is_err());
+        assert!(validate_baseline_name(" leading").is_err());
+        assert!(validate_baseline_name("trailing ").is_err());
+        assert!(validate_baseline_name(&"x".repeat(121)).is_err());
+    }
+
+    #[test]
+    fn latest_completed_run_skips_a_newer_running_run() {
+        let connection = initialize(":memory:").expect("database should initialize");
+        connection.execute_batch(
+            "INSERT INTO runs VALUES ('completed-old', 'app.exe', 100, 150, '0.1', 'completed');
+             INSERT INTO runs VALUES ('running-new', 'app.exe', 200, NULL, '0.1', 'running');",
+        ).expect("test runs should be inserted");
+
+        assert_eq!(
+            latest_completed_run_id(&connection).expect("latest completed run should be found"),
+            Some("completed-old".to_string())
+        );
     }
 
     #[test]
