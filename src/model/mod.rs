@@ -156,3 +156,56 @@ pub struct EvidenceEvent {
     pub source: String,
     pub sensitivity: String,
 }
+
+/// Deterministic comparison of a saved Runtime Passport baseline and a completed run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorDriftReport {
+    pub comparison_schema_version: String,
+    pub generated_at_ms: i64,
+    pub baseline_name: String,
+    pub baseline_source_run_id: String,
+    pub current_run_id: String,
+    pub application: String,
+    /// False when the scope is not like-for-like or cannot be identified.
+    pub comparable: bool,
+    pub baseline_scope: EvidenceScope,
+    pub current_scope: EvidenceScope,
+    pub baseline_collector_sources: Vec<String>,
+    pub current_collector_sources: Vec<String>,
+    pub baseline_event_count: u64,
+    pub current_event_count: u64,
+    pub baseline_event_counts_by_type: BTreeMap<String, u64>,
+    pub current_event_counts_by_type: BTreeMap<String, u64>,
+    pub compared_categories: Vec<String>,
+    pub skipped_categories: Vec<String>,
+    pub findings: Vec<DriftFinding>,
+    pub coverage_changes: Vec<CoverageChange>,
+    pub limitations: Vec<String>,
+}
+
+/// A Passport observation difference with references to the source event records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftFinding {
+    pub finding_id: String,
+    /// `added` or `not_observed`; absence is not represented as proof of removal.
+    pub kind: String,
+    pub category: String,
+    pub observation: String,
+    pub explanation: String,
+    /// Event IDs in the baseline source run that match the observation.
+    pub baseline_event_ids: Vec<String>,
+    /// Event IDs in the current run that directly match the observation.
+    pub current_event_ids: Vec<String>,
+    /// Same-category current-run event IDs reviewed for `not_observed` findings.
+    pub current_context_event_ids: Vec<String>,
+}
+
+/// A difference in the recorded collection scope or event-source provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageChange {
+    pub kind: String,
+    pub category: String,
+    pub baseline_value: Option<String>,
+    pub current_value: Option<String>,
+    pub explanation: String,
+}

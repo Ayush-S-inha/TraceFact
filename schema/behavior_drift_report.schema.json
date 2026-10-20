@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceFact Behavior Drift Report",
+  "type": "object",
+  "required": [
+    "comparison_schema_version",
+    "generated_at_ms",
+    "baseline_name",
+    "baseline_source_run_id",
+    "current_run_id",
+    "application",
+    "comparable",
+    "baseline_scope",
+    "current_scope",
+    "baseline_collector_sources",
+    "current_collector_sources",
+    "baseline_event_count",
+    "current_event_count",
+    "baseline_event_counts_by_type",
+    "current_event_counts_by_type",
+    "compared_categories",
+    "skipped_categories",
+    "findings",
+    "coverage_changes",
+    "limitations"
+  ],
+  "properties": {
+    "comparison_schema_version": {"type": "string", "const": "1.0"},
+    "generated_at_ms": {"type": "integer"},
+    "baseline_name": {"type": "string", "minLength": 1},
+    "baseline_source_run_id": {"type": "string", "minLength": 1},
+    "current_run_id": {"type": "string", "minLength": 1},
+    "application": {"type": "string", "minLength": 1},
+    "comparable": {
+      "type": "boolean",
+      "description": "Whether the baseline and current run have matching, known observation scopes. This does not mean every category was comparable."
+    },
+    "baseline_scope": {"$ref": "#/$defs/scope"},
+    "current_scope": {"$ref": "#/$defs/scope"},
+    "baseline_collector_sources": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "current_collector_sources": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "baseline_event_count": {"type": "integer", "minimum": 0},
+    "current_event_count": {"type": "integer", "minimum": 0},
+    "baseline_event_counts_by_type": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "current_event_counts_by_type": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "compared_categories": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "skipped_categories": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "coverage_changes": {"type": "array", "items": {"$ref": "#/$defs/coverage_change"}},
+    "limitations": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "required": ["platform", "kind", "root_pid", "includes_descendants"],
+      "properties": {
+        "platform": {"type": "string"},
+        "kind": {"type": "string"},
+        "root_pid": {"type": ["integer", "null"], "minimum": 0},
+        "includes_descendants": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "finding_id",
+        "kind",
+        "category",
+        "observation",
+        "explanation",
+        "baseline_event_ids",
+        "current_event_ids",
+        "current_context_event_ids"
+      ],
+      "properties": {
+        "finding_id": {"type": "string", "pattern": "^F-[0-9]{4,}$"},
+        "kind": {"type": "string", "enum": ["added", "not_observed"]},
+        "category": {"type": "string", "enum": ["processes", "network_targets"]},
+        "observation": {"type": "string"},
+        "explanation": {"type": "string"},
+        "baseline_event_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "current_event_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "current_context_event_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "coverage_change": {
+      "type": "object",
+      "required": ["kind", "category", "baseline_value", "current_value", "explanation"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["scope_changed", "source_not_observed", "source_added"]},
+        "category": {"type": "string"},
+        "baseline_value": {"type": ["string", "null"]},
+        "current_value": {"type": ["string", "null"]},
+        "explanation": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

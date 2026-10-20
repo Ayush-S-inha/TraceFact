@@ -37,6 +37,7 @@ fn print_help() {
     println!("  tracefact baseline list");
     println!("  tracefact baseline inspect <name>");
     println!("  tracefact baseline export <name> <path.json>");
+    println!("  tracefact compare <baseline_name> <run_id|latest> [report.json]");
     println!("  tracefact help");
     println!();
     println!(
@@ -831,7 +832,10 @@ fn run_watch(pid: u32) -> Result<(), String> {
         "  Network queue drops:  {}",
         network_watcher.dropped_events()
     );
-    println!("  Active at stop:       {}", active.len());
+    println!(
+        "  Tracked without exit event at stop:       {}",
+        active.len()
+    );
 
     if network_events_saved == 0 {
         println!();
@@ -1206,6 +1210,189 @@ fn run_baseline_export(name: &str, output_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> Result<(), String> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    let (connection, database_path) = storage::open_default().map_err(|error| error.to_string())?;
+    let baseline = storage::get_baseline(&connection, baseline_name)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Baseline '{baseline_name}' was not found."))?;
+    let baseline_run = storage::get_run(&connection, &baseline.source_run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "Baseline source run '{}' was not found.",
+                baseline.source_run_id
+            )
+        })?;
+    if baseline_run.status != "completed" {
+        return Err(format!(
+            "Baseline source run '{}' is no longer completed; refusing to compare against it.",
+            baseline.source_run_id
+        ));
+    }
+
+    let resolved_run_id = if run_id == "latest" {
+        storage::latest_completed_run_id(&connection)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "No completed saved runs were found.".to_string())?
+    } else {
+        run_id.to_string()
+    };
+    let current_run = storage::get_run(&connection, &resolved_run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Run {resolved_run_id} was not found."))?;
+    let report = analysis::compare_baseline_to_run(
+        &baseline,
+        &baseline_run,
+        &current_run,
+        current_unix_ms()?,
+    )?;
+
+    println!("TraceFact behavior comparison");
+    println!();
+    println!("  Database:       {}", database_path.display());
+    println!("  Baseline:       {}", report.baseline_name);
+    println!("  Baseline run:   {}", report.baseline_source_run_id);
+    println!("  Current run:    {}", report.current_run_id);
+    println!("  Application:    {}", report.application);
+    println!(
+        "  Scope match:    {}",
+        if report.comparable {
+            "yes"
+        } else {
+            "no; findings skipped"
+        }
+    );
+    println!(
+        "  Events:         baseline {}, current {}",
+        report.baseline_event_count, report.current_event_count
+    );
+    println!(
+        "  Compared:       {}",
+        if report.compared_categories.is_empty() {
+            "none".to_string()
+        } else {
+            report.compared_categories.join(", ")
+        }
+    );
+    println!(
+        "  Skipped:        {}",
+        if report.skipped_categories.is_empty() {
+            "none".to_string()
+        } else {
+            report.skipped_categories.join(", ")
+        }
+    );
+    println!();
+    if !report.comparable {
+        println!(
+            "No behavior-set findings were generated because the observation scopes do not match."
+        );
+    } else if report.compared_categories.is_empty() {
+        println!("No behavior-set findings were generated because no category had sufficient stored provenance.");
+    } else if report.findings.is_empty() {
+        println!("No set differences were found in the comparable observation categories.");
+    } else {
+        println!("Findings");
+        for finding in &report.findings {
+            println!(
+                "  {} [{}] {}: {}",
+                finding.finding_id, finding.kind, finding.category, finding.observation
+            );
+            println!("    {}", finding.explanation);
+            println!(
+                "    Baseline evidence: {}",
+                if finding.baseline_event_ids.is_empty() {
+                    "no matching event IDs".to_string()
+                } else {
+                    finding.baseline_event_ids.join(", ")
+                }
+            );
+            println!(
+                "    Current evidence:  {}",
+                if finding.current_event_ids.is_empty() {
+                    "no matching event IDs".to_string()
+                } else {
+                    finding.current_event_ids.join(", ")
+                }
+            );
+            if !finding.current_context_event_ids.is_empty() {
+                println!(
+                    "    Current category context: {}",
+                    finding.current_context_event_ids.join(", ")
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("Event counts by type");
+    println!(
+        "  Baseline: {}",
+        serde_json::to_string(&report.baseline_event_counts_by_type)
+            .map_err(|error| format!("Could not serialize baseline event counts: {error}"))?
+    );
+    println!(
+        "  Current:  {}",
+        serde_json::to_string(&report.current_event_counts_by_type)
+            .map_err(|error| format!("Could not serialize current event counts: {error}"))?
+    );
+
+    if !report.coverage_changes.is_empty() {
+        println!();
+        println!("Coverage and scope changes");
+        for change in &report.coverage_changes {
+            println!(
+                "  [{}] {}: {}",
+                change.kind, change.category, change.explanation
+            );
+            if change.baseline_value.is_some() || change.current_value.is_some() {
+                println!(
+                    "    Baseline: {}",
+                    change.baseline_value.as_deref().unwrap_or("not recorded")
+                );
+                println!(
+                    "    Current:  {}",
+                    change.current_value.as_deref().unwrap_or("not recorded")
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("Limitations");
+    for limitation in &report.limitations {
+        println!("  - {limitation}");
+    }
+    println!();
+    println!("A difference is a deterministic result from stored observations, not proof of malicious behavior.");
+
+    if let Some(output_path) = output_path {
+        let json = serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("Could not serialize comparison report: {error}"))?;
+        let path = std::path::Path::new(output_path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!(
+                "Could not create comparison report at {} (existing files are not overwritten): {error}",
+                path.display()
+            ))?;
+        if let Err(error) = file.write_all(&json).and_then(|_| file.write_all(b"\n")) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(format!("Could not write comparison report: {error}"));
+        }
+        println!("Comparison report exported to: {}", path.display());
+        println!("Inspect the report before sharing it; it contains local process and endpoint metadata.");
+    }
+
+    Ok(())
+}
+
 fn run_history(limit: u32) -> Result<(), String> {
     let (connection, database_path) = storage::open_default().map_err(|error| error.to_string())?;
     let runs = storage::list_runs(&connection, limit).map_err(|error| error.to_string())?;
@@ -1372,6 +1559,22 @@ fn main() -> ExitCode {
             },
             _ => {
                 eprintln!("Usage: tracefact baseline <save|list|inspect|export> ...");
+                ExitCode::FAILURE
+            }
+        },
+        Some("compare") => match (args.next(), args.next()) {
+            (Some(baseline_name), Some(run_id)) => {
+                let output_path = args.next();
+                match run_compare(&baseline_name, &run_id, output_path.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("TraceFact could not compare behavior: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Usage: tracefact compare <baseline_name> <run_id|latest> [report.json]");
                 ExitCode::FAILURE
             }
         },

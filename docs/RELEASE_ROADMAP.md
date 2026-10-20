@@ -78,20 +78,28 @@ The first baseline-management pass adds named Runtime Passport baselines from co
 - Stable ordering and duplicate removal for Passport observation lists when a baseline is captured.
 - Explicit source-run, scope, collector, and coverage metadata.
 
-**Still to verify**
-- Run the Part 4 Rust test suite and CLI scenarios on Windows.
-- Exercise migration 1 to 2 against a copy of a real Part 3 database.
-- Baseline comparison and drift findings are Part 5, not part of this checkpoint.
+**Verified on Windows**
+- The Part 4 Rust suite passed with 39 tests; `cargo check`, `cargo build`, and formatting passed.
+- Migration 1 to 2 was tested on a copy of the existing Part 3 database; existing runs and events remained intact and the foreign-key check was clean.
+- A fresh process snapshot was saved as a baseline, listed, inspected, exported, and validated against the baseline JSON Schema.
+- Duplicate names, including a Unicode case variant, were rejected; existing export files were preserved; interrupted runs were rejected as baselines.
+
+Baseline comparison was intentionally left for Part 5.
 
 ### Part 5: Behavior comparison and drift detection
 
-Compare a selected run with its chosen baseline. Produce added, removed, and changed observations, using stable keys and avoiding claims unsupported by the stored evidence.
+The first comparison pass is `tracefact compare <baseline_name> <run_id|latest> [report.json]`. It compares stable Passport observation sets, links differences to stored event IDs, and records changes to scope and event-source provenance separately. It reports an item missing from the current Passport as `not_observed`, not as proof that behavior was removed. Filesystem and loaded-library categories remain out of scope until those collectors exist.
 
 **Acceptance criteria**
-- Equivalent runs do not generate noisy differences from timestamps or unstable ordering.
-- Every detected change links to the baseline and current evidence.
+- Equivalent observation sets do not generate differences because of timestamps or ordering.
+- Findings link to source event IDs where a matching stored event exists.
+- Scope mismatches prevent behavior-set findings rather than producing misleading differences.
+- Categories without suitable provenance are skipped and named in the report.
+- Comparison output validates against its JSON Schema and refuses to overwrite an existing report path.
 - Missing telemetry is not misrepresented as proof of absence.
 - Comparison logic has deterministic unit tests.
+
+The initial set comparison does not yet infer property-level changes such as a process executable changing version or path. Those require stable entity identity and richer collected attributes.
 
 ### Part 6: Windows filesystem observation
 

@@ -34,7 +34,7 @@ Filesystem observation, runtime dependency tracking, comparison, security checks
 
 ## Try it
 
-Build the project with Cargo, then give TraceFact the PID of a running Windows process.
+Build the project with Cargo, then give TraceFact the PID of a running Windows process. The commands below are examples, not one script to paste all at once. For a comparison, use a baseline and a later run of the same application captured in the same observation mode.
 
 ```text
 tracefact process <pid>
@@ -42,13 +42,15 @@ tracefact watch <pid>
 tracefact history
 tracefact inspect latest
 tracefact export latest tracefact-evidence.json
-tracefact baseline save "desktop stable" latest
+tracefact baseline save "desktop stable" <completed_run_id>
 tracefact baseline list
 tracefact baseline inspect "desktop stable"
 tracefact baseline export "desktop stable" desktop-baseline.json
+tracefact compare "desktop stable" <later_completed_run_id>
+tracefact compare "desktop stable" <later_completed_run_id> comparison.json
 ```
 
-Named Runtime Passport baselines can be saved from completed runs. Baselines retain their source run, observation scope, and coverage limitations. Names are unique without regard to case; saving an existing name fails rather than replacing it.
+Named Runtime Passport baselines can be saved from completed runs. Baselines retain their source run, observation scope, and coverage limitations. Names are unique without regard to case; saving an existing name fails rather than replacing it. `tracefact compare <baseline_name> <run_id|latest>` compares a completed run against a baseline. Findings link to stored event IDs where possible; add a JSON path to export the report. For a meaningful comparison, capture the baseline and the later run using the same observation mode for the same application. Comparing a snapshot to a watch run produces a scope mismatch, so behavior-set findings are skipped. `latest` selects the latest completed run, which may still be the baseline's source run if you have not recorded another run. The first comparison pass covers process names and network targets when both runs have suitable provenance. Files and libraries are skipped until those collectors exist. A `not_observed` finding does not prove behavior stopped.
 
 The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. The export command writes a standalone JSON evidence bundle for a finalized run. It refuses to overwrite an existing path. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
 

@@ -75,3 +75,8 @@ The Part 4 checkpoint adds baseline save, list, inspect, and export commands. A 
 The core will be Rust. The local interface will use TypeScript and a web UI. SQLite will hold local data.
 
 Collectors should feed an operating system independent event model. Windows and Linux are the first targets. Linux can get deeper observation later through carefully chosen eBPF integrations.
+
+
+## Current comparison work
+
+The initial Part 5 CLI compares a completed run with a named Runtime Passport baseline. It reports set additions and `not_observed` differences for comparable process and network-target categories, records scope/source-provenance changes separately, and links findings to stored event IDs. It skips categories without suitable provenance and does not claim that missing events prove behavior stopped. Attribute-level change detection, filesystem observation, and loaded-library observation remain future work.
