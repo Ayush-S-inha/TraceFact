@@ -10,6 +10,8 @@ pub enum EventType {
     ProcessObserved,
     NetworkConnection,
     FileAccess,
+    FileChange,
+    FileObserved,
     LibraryLoaded,
     DnsLookup,
     EnvironmentVariableUsed,
@@ -113,7 +115,8 @@ pub struct EvidenceRunMetadata {
 pub struct EvidenceScope {
     /// Operating system inferred from the collector provenance, or "unknown".
     pub platform: String,
-    /// "selected_process_tree_snapshot", "selected_process_tree_watch", or "unknown".
+    /// "selected_process_tree_snapshot", "selected_process_tree_watch",
+    /// "selected_directory_watch", or "unknown".
     pub kind: String,
     /// The root PID when it can be recovered from stored metadata.
     pub root_pid: Option<u32>,

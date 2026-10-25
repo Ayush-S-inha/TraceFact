@@ -22,3 +22,4 @@ windows-sys = { version = ">=0.59, <=0.61", features = ["Win32_Foundation", "Win
 wmi = "0.18"
 ctrlc = "3"
 windows-erg = "0.2"
+notify = "8.2.0"

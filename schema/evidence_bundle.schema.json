@@ -76,6 +76,7 @@
           "type": "string",
           "enum": [
             "selected_process_tree_snapshot",
+            "selected_directory_watch",
             "selected_process_tree_watch",
             "unknown"
           ]
@@ -89,7 +90,7 @@
         },
         "includes_descendants": {
           "type": "boolean",
-          "description": "Whether the selected collector scope is intended to include descendants; this is not proof that descendants existed or were observed."
+          "description": "Whether the selected collection recursively includes descendants in its scope (child processes or nested directories); this is not proof they existed or were observed."
         }
       },
       "additionalProperties": false

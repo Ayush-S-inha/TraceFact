@@ -7,7 +7,9 @@ use crate::model::{
 };
 use crate::storage::StoredRun;
 
-#[derive(Debug, Default)]
+const MAX_INITIAL_FILES_EVIDENCE_NOTE: u64 = 10_000;
+
+#[derive(Debug, Default, Clone)]
 pub struct PassportAccumulator {
     processes: BTreeSet<String>,
     network_targets: BTreeSet<String>,
@@ -26,9 +28,37 @@ impl PassportAccumulator {
                     self.network_targets.insert(target.clone());
                 }
             }
-            EventType::FileAccess => {
+            EventType::FileAccess | EventType::FileObserved => {
                 if let Some(target) = &event.target {
                     self.files.insert(target.clone());
+                }
+            }
+            EventType::FileChange => {
+                if let Some(target) = &event.target {
+                    match event
+                        .metadata
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("removed") => {
+                            remove_path_and_descendants(&mut self.files, target);
+                        }
+                        Some("renamed_from") => {
+                            if let Some(new_path) = event
+                                .metadata
+                                .get("related_path")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                rename_path_and_descendants(&mut self.files, target, new_path);
+                            } else {
+                                remove_path_and_descendants(&mut self.files, target);
+                            }
+                        }
+                        Some("created" | "modified" | "renamed_to" | "renamed") => {
+                            self.files.insert(target.clone());
+                        }
+                        _ => {}
+                    }
                 }
             }
             EventType::LibraryLoaded => {
@@ -59,6 +89,34 @@ impl PassportAccumulator {
             },
             changes: vec![],
         }
+    }
+}
+
+fn remove_path_and_descendants(files: &mut BTreeSet<String>, path: &str) {
+    let prefix = format!("{}/", path.trim_end_matches('/'));
+    files.retain(|item| item != path && !item.starts_with(&prefix));
+}
+
+fn rename_path_and_descendants(files: &mut BTreeSet<String>, old_path: &str, new_path: &str) {
+    let prefix = format!("{}/", old_path.trim_end_matches('/'));
+    let affected: Vec<String> = files
+        .iter()
+        .filter(|item| *item == old_path || item.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for item in affected {
+        files.remove(&item);
+        let suffix = if item == old_path {
+            ""
+        } else {
+            item.strip_prefix(&prefix).unwrap_or_default()
+        };
+        let renamed = if suffix.is_empty() {
+            new_path.to_string()
+        } else {
+            format!("{}/{}", new_path.trim_end_matches('/'), suffix)
+        };
+        files.insert(renamed);
     }
 }
 
@@ -143,12 +201,17 @@ pub fn evidence_bundle_from_run(
     let is_watch = collector_sources
         .iter()
         .any(|source| source == "windows_process_watch");
+    let is_filesystem_watch = collector_sources
+        .iter()
+        .any(|source| source == "windows_filesystem_watch");
     let network_event_count = event_counts_by_type
         .get("network_connection")
         .copied()
         .unwrap_or(0);
 
-    let scope_kind = if is_watch {
+    let scope_kind = if is_filesystem_watch {
+        "selected_directory_watch"
+    } else if is_watch {
         "selected_process_tree_watch"
     } else if has_windows_provenance {
         "selected_process_tree_snapshot"
@@ -161,22 +224,78 @@ pub fn evidence_bundle_from_run(
         "unknown"
     };
 
-    let mut limitations = vec![
-        "An absent event is not proof that the behavior did not occur.".to_string(),
-        "Filesystem access and loaded-library observation are not implemented in this checkpoint."
-            .to_string(),
-    ];
+    let mut limitations =
+        vec!["An absent event is not proof that the behavior did not occur.".to_string()];
 
-    if !is_watch {
+    if is_filesystem_watch {
         limitations.push(
-            "This is a point-in-time process snapshot; network collection runs only in watch mode."
-                .to_string(),
+            "Filesystem observation covers a bounded initial directory inventory and change notifications; it does not record file contents, file reads, or the process responsible for a change.".to_string(),
         );
-    } else if network_event_count == 0 {
         limitations.push(
-            "No network connection events were stored. This is not proof that no network activity occurred."
-                .to_string(),
+            "Filesystem notifications may be coalesced or lost under load. Inspect the watch summary and queue-drop count before interpreting the run.".to_string(),
         );
+        for event in &run.events {
+            if event.source != "windows_filesystem_watch" || event.event_type != "file_change" {
+                continue;
+            }
+            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&event.metadata_json) {
+                if metadata
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("watch_summary")
+                {
+                    if metadata
+                        .get("initial_inventory_truncated")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        let maximum = metadata
+                            .get("maximum_initial_inventory_entries")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(MAX_INITIAL_FILES_EVIDENCE_NOTE);
+                        limitations.push(format!("The initial filesystem inventory was capped at {maximum} entries; the directory baseline is incomplete."));
+                    }
+                    if metadata
+                        .get("initial_inventory_unreadable")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+                    {
+                        limitations.push("Some filesystem entries could not be read during the initial inventory because of enumeration or permission errors.".to_string());
+                    }
+                    if metadata
+                        .get("notification_queue_dropped")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        > 0
+                    {
+                        limitations.push("The bounded filesystem notification queue dropped events; change observations are incomplete.".to_string());
+                    }
+                    if metadata
+                        .get("filesystem_coverage_requires_review")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        limitations.push("A directory create/rename or an unclassified/rescan notification may have changed the tree without a complete path list; filesystem-path comparison is skipped for this run.".to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        limitations.push(
+            "Filesystem observation is limited to the separate selected-directory watch, and loaded-library observation is not implemented in this checkpoint.".to_string(),
+        );
+        if !is_watch {
+            limitations.push(
+                "This is a point-in-time process snapshot; network collection runs only in watch mode."
+                    .to_string(),
+            );
+        } else if network_event_count == 0 {
+            limitations.push(
+                "No network connection events were stored. This is not proof that no network activity occurred."
+                    .to_string(),
+            );
+        }
     }
 
     if run.status != "completed" {
@@ -374,7 +493,32 @@ pub fn compare_baseline_to_run(
         }
     }
 
-    if scope_matches {
+    if scope_matches && baseline_scope.kind == "selected_directory_watch" {
+        let files_comparable = baseline_sources.contains("windows_filesystem_watch")
+            && current_sources.contains("windows_filesystem_watch")
+            && baseline_sources.contains("windows_filesystem_snapshot")
+            && current_sources.contains("windows_filesystem_snapshot")
+            && filesystem_coverage_complete(baseline_run)
+            && filesystem_coverage_complete(current_run);
+        compare_observation_category(
+            &mut findings,
+            &mut compared_categories,
+            &mut skipped_categories,
+            "files",
+            &baseline_scope.platform,
+            &baseline.passport.observations.files,
+            &current_run.passport.observations.files,
+            files_comparable,
+            baseline_run,
+            current_run,
+        );
+        if skipped_categories.iter().any(|item| item == "files") {
+            limitations.push("Filesystem-path comparison was skipped because one or both runs lack complete initial-inventory/change-notification provenance, have unreadable or truncated inventory, dropped notifications, or a directory-tree change whose descendants could not be reconciled safely.".to_string());
+        }
+        skipped_categories.push("processes".to_string());
+        skipped_categories.push("network_targets".to_string());
+        skipped_categories.push("libraries".to_string());
+    } else if scope_matches {
         compare_observation_category(
             &mut findings,
             &mut compared_categories,
@@ -414,14 +558,14 @@ pub fn compare_baseline_to_run(
         {
             limitations.push("Network-target comparisons were skipped because the stored collector provenance does not establish network observation coverage for both runs. A lack of stored network events is not proof that no network activity occurred.".to_string());
         }
+        skipped_categories.push("files".to_string());
+        skipped_categories.push("libraries".to_string());
     } else {
         skipped_categories.push("processes".to_string());
         skipped_categories.push("network_targets".to_string());
-        limitations.push("Process and network observation comparisons were skipped because the baseline and current run have different or unknown observation scopes.".to_string());
-    }
-
-    for category in ["files", "libraries"] {
-        skipped_categories.push(category.to_string());
+        skipped_categories.push("files".to_string());
+        skipped_categories.push("libraries".to_string());
+        limitations.push("Observation comparisons were skipped because the baseline and current run have different or unknown observation scopes.".to_string());
     }
 
     let mut unique_limitations = BTreeSet::new();
@@ -477,6 +621,57 @@ pub fn compare_baseline_to_run(
         coverage_changes,
         limitations,
     })
+}
+
+fn filesystem_coverage_complete(run: &StoredRun) -> bool {
+    let mut inventory_summary_seen = false;
+    let mut watch_summary_seen = false;
+    for event in &run.events {
+        if event.event_type != "file_observed" && event.event_type != "file_change" {
+            continue;
+        }
+        let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&event.metadata_json) else {
+            return false;
+        };
+        let operation = metadata
+            .get("operation")
+            .and_then(serde_json::Value::as_str);
+        if event.source == "windows_filesystem_snapshot" && operation == Some("inventory_summary") {
+            inventory_summary_seen = true;
+            if metadata
+                .get("initial_inventory_truncated")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+                || metadata
+                    .get("initial_inventory_unreadable")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+                    > 0
+            {
+                return false;
+            }
+        }
+        if event.source == "windows_filesystem_watch" && operation == Some("watch_summary") {
+            watch_summary_seen = true;
+            if metadata
+                .get("notification_queue_dropped")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1)
+                > 0
+                || metadata
+                    .get("notification_error_present")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+                || metadata
+                    .get("filesystem_coverage_requires_review")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+            {
+                return false;
+            }
+        }
+    }
+    inventory_summary_seen && watch_summary_seen
 }
 
 fn has_process_provenance(sources: &[String]) -> bool {
@@ -575,7 +770,9 @@ fn observation_map(
 fn comparison_key(category: &str, platform: &str, value: &str) -> String {
     // Windows process names are case-insensitive, as are DNS names and hexadecimal
     // letters in network endpoints. Keep exact comparison on other platforms.
-    if platform == "windows" && (category == "processes" || category == "network_targets") {
+    if platform == "windows"
+        && (category == "processes" || category == "network_targets" || category == "files")
+    {
         value.to_lowercase()
     } else {
         value.to_string()
@@ -591,6 +788,7 @@ fn category_context_event_ids(run: &StoredRun, category: &str) -> Vec<String> {
             "network_targets" => {
                 event.event_type == "network_connection" || event.event_type == "dns_lookup"
             }
+            "files" => event.event_type == "file_change" || event.event_type == "file_observed",
             _ => false,
         })
         .map(|event| event.event_id.clone())
@@ -618,6 +816,11 @@ fn matching_event_ids(
                 "network_targets"
                     if event.event_type == "network_connection"
                         || event.event_type == "dns_lookup" =>
+                {
+                    event.target.as_deref()
+                }
+                "files"
+                    if event.event_type == "file_change" || event.event_type == "file_observed" =>
                 {
                     event.target.as_deref()
                 }
@@ -688,6 +891,64 @@ mod evidence_bundle_tests {
                 },
             ],
         }
+    }
+
+    fn sample_filesystem_run(run_id: &str, initial_files: &[&str]) -> StoredRun {
+        let root = "C:/TraceFactTest";
+        let mut run = sample_run("completed");
+        run.run_id = run_id.to_string();
+        run.application = format!("directory:{root}");
+        run.started_at_ms = 1_000;
+        run.ended_at_ms = Some(2_000);
+        run.passport.passport_id = format!("passport-{run_id}");
+        run.passport.application = run.application.clone();
+        run.passport.observations.processes.clear();
+        run.passport.observations.network_targets.clear();
+        run.passport.observations.files = initial_files
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect();
+        run.events.clear();
+
+        run.events.push(StoredEvent {
+            event_id: format!("{run_id}-inventory-summary"),
+            timestamp_ms: 1_000,
+            event_type: "file_observed".to_string(),
+            pid: Some(0),
+            executable: Some("filesystem-observer".to_string()),
+            subject: Some("inventory_summary".to_string()),
+            target: None,
+            metadata_json: format!(r#"{{"operation":"inventory_summary","initial_inventory_truncated":false,"initial_inventory_unreadable":0,"watch_root":"{root}"}}"#),
+            source: "windows_filesystem_snapshot".to_string(),
+            sensitivity: "SystemMetadata".to_string(),
+        });
+        for (index, path) in initial_files.iter().enumerate() {
+            run.events.push(StoredEvent {
+                event_id: format!("{run_id}-present-{index}"),
+                timestamp_ms: 1_010 + index as i64,
+                event_type: "file_observed".to_string(),
+                pid: Some(0),
+                executable: Some("filesystem-observer".to_string()),
+                subject: Some("present_at_start".to_string()),
+                target: Some((*path).to_string()),
+                metadata_json: format!(r#"{{"operation":"present_at_start","entry_kind":"file","watch_root":"{root}"}}"#),
+                source: "windows_filesystem_snapshot".to_string(),
+                sensitivity: "PotentiallySensitive".to_string(),
+            });
+        }
+        run.events.push(StoredEvent {
+            event_id: format!("{run_id}-watch-summary"),
+            timestamp_ms: 2_000,
+            event_type: "file_change".to_string(),
+            pid: Some(0),
+            executable: Some("filesystem-observer".to_string()),
+            subject: Some("watch_summary".to_string()),
+            target: None,
+            metadata_json: format!(r#"{{"operation":"watch_summary","notification_queue_dropped":0,"notification_error_present":false,"filesystem_coverage_requires_review":false,"initial_inventory_truncated":false,"initial_inventory_unreadable":0,"watch_root":"{root}"}}"#),
+            source: "windows_filesystem_watch".to_string(),
+            sensitivity: "SystemMetadata".to_string(),
+        });
+        run
     }
 
     #[test]
@@ -1003,6 +1264,83 @@ mod evidence_bundle_tests {
             .expect("case-only variations should compare");
         assert!(report.comparable);
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn directory_watch_comparison_reports_path_additions_and_not_observed_paths() {
+        let baseline_run = sample_filesystem_run("filesystem-baseline", &["old.txt"]);
+        let baseline = super::baseline_from_run(&baseline_run, "directory baseline", 3_000)
+            .expect("completed filesystem run should become a baseline");
+
+        let mut current_run = sample_filesystem_run("filesystem-current", &["new.txt"]);
+        current_run.events.push(StoredEvent {
+            event_id: "current-remove-old".to_string(),
+            timestamp_ms: 1_500,
+            event_type: "file_change".to_string(),
+            pid: Some(0),
+            executable: Some("filesystem-observer".to_string()),
+            subject: Some("removed".to_string()),
+            target: Some("old.txt".to_string()),
+            metadata_json: r#"{"operation":"removed","watch_root":"C:\\TraceFactTest"}"#
+                .to_string(),
+            source: "windows_filesystem_watch".to_string(),
+            sensitivity: "PotentiallySensitive".to_string(),
+        });
+        current_run.events.push(StoredEvent {
+            event_id: "current-create-new".to_string(),
+            timestamp_ms: 1_600,
+            event_type: "file_change".to_string(),
+            pid: Some(0),
+            executable: Some("filesystem-observer".to_string()),
+            subject: Some("created".to_string()),
+            target: Some("new.txt".to_string()),
+            metadata_json:
+                r#"{"operation":"created","entry_kind":"file","watch_root":"C:\\TraceFactTest"}"#
+                    .to_string(),
+            source: "windows_filesystem_watch".to_string(),
+            sensitivity: "PotentiallySensitive".to_string(),
+        });
+
+        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
+            .expect("matching directory scopes should compare");
+        assert!(report.comparable);
+        assert!(report.compared_categories.contains(&"files".to_string()));
+        assert!(report.skipped_categories.contains(&"processes".to_string()));
+        assert!(report
+            .skipped_categories
+            .contains(&"network_targets".to_string()));
+
+        let added = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.category == "files"
+                    && finding.kind == "added"
+                    && finding.observation == "new.txt"
+            })
+            .expect("new file should be reported");
+        assert!(added
+            .current_event_ids
+            .contains(&"current-create-new".to_string()));
+
+        let not_observed = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.category == "files"
+                    && finding.kind == "not_observed"
+                    && finding.observation == "old.txt"
+            })
+            .expect("removed old file should be not-observed in the current Passport");
+        assert!(not_observed
+            .baseline_event_ids
+            .iter()
+            .any(|id| id.contains("present-0")));
+        assert!(not_observed.current_event_ids.is_empty());
+        assert!(not_observed
+            .current_context_event_ids
+            .contains(&"current-remove-old".to_string()));
+        assert!(not_observed.explanation.contains("does not prove"));
     }
 
     #[test]

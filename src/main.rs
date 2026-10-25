@@ -29,6 +29,7 @@ fn print_help() {
     println!("  tracefact demo");
     println!("  tracefact process <pid>");
     println!("  tracefact watch <pid>");
+    println!("  tracefact watch-files <directory> [duration_seconds]");
     println!("  tracefact history");
     println!("  tracefact inspect <run_id>");
     println!("  tracefact inspect latest");
@@ -832,10 +833,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
         "  Network queue drops:  {}",
         network_watcher.dropped_events()
     );
-    println!(
-        "  Tracked without exit event at stop:       {}",
-        active.len()
-    );
+    println!("  Active at stop:       {}", active.len());
 
     if network_events_saved == 0 {
         println!();
@@ -1393,6 +1391,504 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
     Ok(())
 }
 
+#[cfg(windows)]
+fn filesystem_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn filesystem_snapshot_event(
+    started_at_ms: i64,
+    sequence: u64,
+    root: &std::path::Path,
+    entry: &collectors::windows_filesystem::InventoryEntry,
+) -> model::RuntimeEvent {
+    model::RuntimeEvent {
+        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        timestamp_ms: started_at_ms,
+        event_type: model::EventType::FileObserved,
+        process: model::ProcessIdentity {
+            // PID 0 is a sentinel: notify does not identify the process responsible for a change.
+            pid: 0,
+            executable: "filesystem-observer".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "present_at_start".to_string(),
+        target: Some(entry.relative_path.clone()),
+        metadata: serde_json::json!({
+            "operation": "present_at_start",
+            "entry_kind": entry.entry_kind,
+            "watch_root": root.to_string_lossy(),
+            "process_attribution": "not_available"
+        }),
+        source: "windows_filesystem_snapshot".to_string(),
+        sensitivity: model::Sensitivity::PotentiallySensitive,
+    }
+}
+
+#[cfg(windows)]
+fn filesystem_inventory_summary_event(
+    started_at_ms: i64,
+    sequence: u64,
+    root: &std::path::Path,
+    inventory: &collectors::windows_filesystem::InitialInventory,
+) -> model::RuntimeEvent {
+    model::RuntimeEvent {
+        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        timestamp_ms: started_at_ms,
+        event_type: model::EventType::FileObserved,
+        process: model::ProcessIdentity {
+            pid: 0,
+            executable: "filesystem-observer".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "inventory_summary".to_string(),
+        target: None,
+        metadata: serde_json::json!({
+            "operation": "inventory_summary",
+            "watch_root": root.to_string_lossy(),
+            "initial_inventory_entries": inventory.entries.len(),
+            "initial_inventory_truncated": inventory.truncated,
+            "initial_inventory_unreadable": inventory.unreadable_entries,
+            "maximum_initial_inventory_entries": collectors::windows_filesystem::MAX_INITIAL_INVENTORY_ENTRIES,
+            "process_attribution": "not_available"
+        }),
+        source: "windows_filesystem_snapshot".to_string(),
+        sensitivity: model::Sensitivity::SystemMetadata,
+    }
+}
+
+#[cfg(windows)]
+fn filesystem_change_event(
+    started_at_ms: i64,
+    sequence: u64,
+    root: &std::path::Path,
+    observation: collectors::windows_filesystem::FileSystemObservation,
+) -> model::RuntimeEvent {
+    model::RuntimeEvent {
+        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        timestamp_ms: filesystem_now_ms(),
+        event_type: model::EventType::FileChange,
+        process: model::ProcessIdentity {
+            pid: 0,
+            executable: "filesystem-observer".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: observation.operation.to_string(),
+        target: Some(observation.path),
+        metadata: serde_json::json!({
+            "operation": observation.operation,
+            "related_path": observation.related_path,
+            "watch_root": root.to_string_lossy(),
+            "entry_kind": observation.entry_kind,
+            "process_attribution": "not_available"
+        }),
+        source: "windows_filesystem_watch".to_string(),
+        sensitivity: model::Sensitivity::PotentiallySensitive,
+    }
+}
+
+#[cfg(windows)]
+fn filesystem_watch_summary_event(
+    started_at_ms: i64,
+    sequence: u64,
+    root: &std::path::Path,
+    inventory: &collectors::windows_filesystem::InitialInventory,
+    dropped_events: usize,
+    notification_error_present: bool,
+    filesystem_coverage_requires_review: bool,
+) -> model::RuntimeEvent {
+    model::RuntimeEvent {
+        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        timestamp_ms: filesystem_now_ms(),
+        event_type: model::EventType::FileChange,
+        process: model::ProcessIdentity {
+            pid: 0,
+            executable: "filesystem-observer".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "watch_summary".to_string(),
+        target: None,
+        metadata: serde_json::json!({
+            "operation": "watch_summary",
+            "watch_root": root.to_string_lossy(),
+            "notification_queue_dropped": dropped_events,
+            "notification_error_present": notification_error_present,
+            "filesystem_coverage_requires_review": filesystem_coverage_requires_review,
+            "initial_inventory_entries": inventory.entries.len(),
+            "initial_inventory_truncated": inventory.truncated,
+            "initial_inventory_unreadable": inventory.unreadable_entries,
+            "maximum_initial_inventory_entries": collectors::windows_filesystem::MAX_INITIAL_INVENTORY_ENTRIES,
+            "process_attribution": "not_available"
+        }),
+        source: "windows_filesystem_watch".to_string(),
+        sensitivity: model::Sensitivity::SystemMetadata,
+    }
+}
+
+#[cfg(windows)]
+fn filesystem_notification_gap_event(
+    started_at_ms: i64,
+    sequence: u64,
+    root: &std::path::Path,
+    notify_event: &notify::Event,
+) -> model::RuntimeEvent {
+    let relative_paths: Vec<String> = notify_event
+        .paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    model::RuntimeEvent {
+        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        timestamp_ms: filesystem_now_ms(),
+        event_type: model::EventType::FileChange,
+        process: model::ProcessIdentity {
+            pid: 0,
+            executable: "filesystem-observer".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "coverage_gap".to_string(),
+        target: None,
+        metadata: serde_json::json!({
+            "operation": "coverage_gap",
+            "event_kind": format!("{:?}", notify_event.kind),
+            "reported_relative_paths": relative_paths,
+            "watch_root": root.to_string_lossy(),
+            "process_attribution": "not_available",
+            "reason": "The notification backend reported an unclassified or rescan event; complete path-level change details are not available."
+        }),
+        source: "windows_filesystem_watch".to_string(),
+        sensitivity: model::Sensitivity::SystemMetadata,
+    }
+}
+
+#[cfg(windows)]
+fn persist_filesystem_notification(
+    notify_event: &notify::Event,
+    root: &std::path::Path,
+    run_id: &str,
+    started_at_ms: i64,
+    connection: &mut rusqlite::Connection,
+    passport: &mut analysis::PassportAccumulator,
+    sequence: &mut u64,
+    filesystem_coverage_requires_review: &mut bool,
+) -> Result<usize, String> {
+    let mut saved = 0_usize;
+    if matches!(
+        &notify_event.kind,
+        notify::EventKind::Any | notify::EventKind::Other
+    ) {
+        // notify can emit an Other/Rescan event when the operating system no longer has a
+        // complete list of individual changes. Record the gap and block clean file comparison.
+        *filesystem_coverage_requires_review = true;
+        let gap_event =
+            filesystem_notification_gap_event(started_at_ms, *sequence, root, notify_event);
+        storage::append_event(connection, run_id, &gap_event)
+            .map_err(|error| format!("Could not save filesystem coverage-gap event: {error}"))?;
+        passport.observe(&gap_event);
+        *sequence = sequence.saturating_add(1);
+        saved = saved.saturating_add(1);
+    }
+    let observations = collectors::windows_filesystem::observations_from_event(notify_event, root);
+    for observation in observations {
+        // Windows commonly emits rename-from and rename-to as two separate notifications.
+        // Those are applied in order by the Passport accumulator; only an explicitly ambiguous
+        // single-path rename forces the filesystem coverage check to fail.
+        let rename_is_ambiguous = observation.operation == "renamed";
+        let directory_may_have_descendants =
+            matches!(observation.operation, "created" | "renamed_to")
+                && !matches!(observation.entry_kind, "file" | "symlink");
+        if rename_is_ambiguous || directory_may_have_descendants {
+            // Directory moves/creates may carry descendants that the notification backend does
+            // not enumerate individually. An ambiguous rename may not identify both paths.
+            // Keep the evidence, but don't use it for a clean diff.
+            *filesystem_coverage_requires_review = true;
+        }
+        let event = filesystem_change_event(started_at_ms, *sequence, root, observation);
+        storage::append_event(connection, run_id, &event)
+            .map_err(|error| format!("Could not save filesystem observation: {error}"))?;
+        passport.observe(&event);
+        *sequence = sequence.saturating_add(1);
+        saved = saved.saturating_add(1);
+    }
+    Ok(saved)
+}
+
+#[cfg(windows)]
+fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(), String> {
+    use collectors::windows_filesystem::{
+        initial_inventory, FileSystemWatchMessage, WindowsFileSystemEventWatcher,
+    };
+    use std::sync::mpsc::TryRecvError;
+
+    if duration_seconds == Some(0) {
+        return Err("The watch duration must be greater than zero seconds.".to_string());
+    }
+
+    let root = std::fs::canonicalize(directory).map_err(|error| {
+        format!(
+            "Could not resolve selected directory '{}': {error}",
+            directory
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Selected path is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_handler = Arc::clone(&stop_requested);
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
+
+    // Start notifications before taking the initial inventory to reduce the observation gap.
+    let mut watcher =
+        WindowsFileSystemEventWatcher::start(&root).map_err(|error| error.to_string())?;
+    let receiver = watcher
+        .take_receiver()
+        .ok_or_else(|| "Filesystem watcher receiver was already taken.".to_string())?;
+    let inventory = initial_inventory(&root);
+    let started_at_ms = filesystem_now_ms();
+    let run_id = format!("filesystem-{started_at_ms}-{}", std::process::id());
+    let application = format!("directory:{}", root.display());
+
+    let mut initial_events = Vec::with_capacity(inventory.entries.len().saturating_add(1));
+    let mut sequence = 0_u64;
+    for entry in &inventory.entries {
+        initial_events.push(filesystem_snapshot_event(
+            started_at_ms,
+            sequence,
+            &root,
+            entry,
+        ));
+        sequence = sequence.saturating_add(1);
+    }
+    initial_events.push(filesystem_inventory_summary_event(
+        started_at_ms,
+        sequence,
+        &root,
+        &inventory,
+    ));
+    sequence = sequence.saturating_add(1);
+
+    let (mut connection, database_path) =
+        storage::open_default().map_err(|error| error.to_string())?;
+    let initial_snapshot = model::RuntimeSnapshot {
+        schema_version: "0.1".to_string(),
+        snapshot_id: run_id.clone(),
+        application: application.clone(),
+        started_at_ms,
+        ended_at_ms: None,
+        events: Vec::new(),
+    };
+    let mut passport = analysis::PassportAccumulator::default();
+    for event in &initial_events {
+        passport.observe(event);
+    }
+    let initial_passport = passport
+        .clone()
+        .finish(&run_id, started_at_ms, &application);
+    storage::begin_run_with_events(
+        &mut connection,
+        &initial_snapshot,
+        &initial_passport,
+        &initial_events,
+    )
+    .map_err(|error| format!("Could not begin filesystem watch run: {error}"))?;
+
+    println!("TraceFact selected-directory watch");
+    println!();
+    println!("  Directory:                 {}", root.display());
+    println!("  Includes subdirectories:   yes");
+    println!("  Initial entries recorded:  {}", inventory.entries.len());
+    println!("  Initial inventory capped:  {}", inventory.truncated);
+    println!(
+        "  Inventory read errors:    {}",
+        inventory.unreadable_entries
+    );
+    println!("  Process attribution:      unavailable");
+    println!("  File contents captured:   no");
+    println!("  Database:                 {}", database_path.display());
+    println!("  Run ID:                   {run_id}");
+    match duration_seconds {
+        Some(seconds) => println!("  Duration:                 {seconds} seconds"),
+        None => println!("  Duration:                 until Ctrl+C"),
+    }
+    println!();
+    println!(
+        "Recording create, modify, rename, and remove notifications. Press Ctrl+C to stop early."
+    );
+
+    let watch_started = std::time::Instant::now();
+    let mut stop_reason = "stopped by user";
+    let mut watch_error: Option<String> = None;
+    let mut changes_saved = 0_u64;
+    let mut filesystem_coverage_requires_review = false;
+
+    'watch: loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            stop_reason = "stopped by user";
+            break;
+        }
+        if let Some(seconds) = duration_seconds {
+            if watch_started.elapsed() >= std::time::Duration::from_secs(seconds) {
+                stop_reason = "duration elapsed";
+                break;
+            }
+        }
+        if let Some(error) = watcher.first_error() {
+            watch_error = Some(error);
+            stop_reason = "filesystem notification error";
+            break;
+        }
+
+        match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(FileSystemWatchMessage::Event(notify_event)) => {
+                match persist_filesystem_notification(
+                    &notify_event,
+                    &root,
+                    &run_id,
+                    started_at_ms,
+                    &mut connection,
+                    &mut passport,
+                    &mut sequence,
+                    &mut filesystem_coverage_requires_review,
+                ) {
+                    Ok(saved) => changes_saved = changes_saved.saturating_add(saved as u64),
+                    Err(error) => {
+                        watch_error = Some(error);
+                        stop_reason = "storage error";
+                        break 'watch;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                watch_error =
+                    Some("Filesystem notification queue disconnected unexpectedly.".to_string());
+                stop_reason = "notification queue disconnected";
+                break;
+            }
+        }
+    }
+
+    watcher.stop();
+    if watch_error.is_none() {
+        watch_error = watcher.first_error();
+        if watch_error.is_some() {
+            stop_reason = "filesystem notification error";
+        }
+    }
+    let dropped_events = watcher.dropped_events();
+
+    // Drain already-queued callbacks after stopping the native watcher. The channel is bounded,
+    // so this drain is finite and does not continue listening for new notifications.
+    loop {
+        match receiver.try_recv() {
+            Ok(FileSystemWatchMessage::Event(notify_event)) => {
+                match persist_filesystem_notification(
+                    &notify_event,
+                    &root,
+                    &run_id,
+                    started_at_ms,
+                    &mut connection,
+                    &mut passport,
+                    &mut sequence,
+                    &mut filesystem_coverage_requires_review,
+                ) {
+                    Ok(saved) => changes_saved = changes_saved.saturating_add(saved as u64),
+                    Err(error) => {
+                        if watch_error.is_none() {
+                            watch_error = Some(error);
+                            stop_reason = "storage error while draining queued events";
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+
+    let summary_event = filesystem_watch_summary_event(
+        started_at_ms,
+        sequence,
+        &root,
+        &inventory,
+        dropped_events,
+        watch_error.is_some(),
+        filesystem_coverage_requires_review,
+    );
+    if let Err(error) = storage::append_event(&mut connection, &run_id, &summary_event) {
+        if watch_error.is_none() {
+            watch_error = Some(format!(
+                "Could not save filesystem coverage summary: {error}"
+            ));
+            stop_reason = "summary persistence error";
+        }
+    } else {
+        passport.observe(&summary_event);
+        sequence = sequence.saturating_add(1);
+    }
+
+    let terminal_status = if watch_error.is_some() {
+        "failed"
+    } else if stop_reason == "duration elapsed" {
+        "completed"
+    } else {
+        "interrupted"
+    };
+    let ended_at_ms = filesystem_now_ms();
+    let final_passport = passport.finish(&run_id, ended_at_ms, &application);
+    storage::finish_run_with_status(
+        &mut connection,
+        &run_id,
+        ended_at_ms,
+        &final_passport,
+        terminal_status,
+    )
+    .map_err(|error| format!("Could not finalize filesystem run {run_id}: {error}"))?;
+
+    println!();
+    println!("Filesystem watch finished: {stop_reason}");
+    println!("  Status:                 {terminal_status}");
+    println!("  Initial entries:        {}", inventory.entries.len());
+    println!("  Change observations:    {changes_saved}");
+    println!("  Stored events:          {sequence}");
+    println!("  Notification queue drops: {dropped_events}");
+    println!("  Initial inventory capped: {}", inventory.truncated);
+    println!(
+        "  Initial inventory errors: {}",
+        inventory.unreadable_entries
+    );
+    if let Some(error) = &watch_error {
+        eprintln!("  Collector/storage error: {error}");
+    }
+    println!("  Run ID:                 {run_id}");
+    println!();
+    println!("No process-level file attribution is available in this collector. Review coverage before comparing this run.");
+
+    if let Some(error) = watch_error {
+        return Err(format!(
+            "Filesystem watch run was finalized as failed: {error}"
+        ));
+    }
+    Ok(())
+}
+
 fn run_history(limit: u32) -> Result<(), String> {
     let (connection, database_path) = storage::open_default().map_err(|error| error.to_string())?;
     let runs = storage::list_runs(&connection, limit).map_err(|error| error.to_string())?;
@@ -1428,7 +1924,8 @@ fn main() -> ExitCode {
             println!("TraceFact doctor");
             println!("  Core:            ready");
             println!("  Storage design:  SQLite");
-            println!("  Network:         TCP metadata in watch mode");
+            println!("  Network:         TCP metadata in process watch mode");
+            println!("  Filesystem:      selected directory tree watch on Windows");
             println!("  Payload capture: disabled");
             println!("  Telemetry:       disabled");
             println!("  AI:              optional / not required");
@@ -1471,6 +1968,45 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("watch-files") => {
+            let remaining: Vec<String> = args.collect();
+            if remaining.is_empty() {
+                eprintln!("Usage: tracefact watch-files <directory> [duration_seconds]");
+                ExitCode::FAILURE
+            } else {
+                // A numeric final argument is treated as duration. Quote directory paths that
+                // contain spaces so they remain one argument.
+                let mut parts = remaining;
+                let duration_seconds = if parts.len() >= 2 {
+                    parts
+                        .last()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|duration| {
+                            parts.pop();
+                            duration
+                        })
+                } else {
+                    None
+                };
+                let directory = parts.join(" ");
+                #[cfg(windows)]
+                {
+                    match run_watch_files(&directory, duration_seconds) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("TraceFact filesystem watch failed: {error}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (directory, duration_seconds);
+                    eprintln!("The selected-directory filesystem watcher is currently available only on Windows.");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("process") => match args.next().and_then(|value| value.parse::<u32>().ok()) {
             Some(pid) => match run_process(pid) {
                 Ok(()) => ExitCode::SUCCESS,

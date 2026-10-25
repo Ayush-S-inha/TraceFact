@@ -38,24 +38,35 @@
     },
     "scope": {
       "type": "object",
-      "required": ["platform", "kind", "root_pid", "includes_descendants"],
+      "required": [
+        "platform",
+        "kind",
+        "root_pid",
+        "includes_descendants"
+      ],
       "properties": {
-        "platform": {"type": "string"},
+        "platform": {
+          "type": "string"
+        },
         "kind": {
           "type": "string",
           "enum": [
             "selected_process_tree_snapshot",
+            "selected_directory_watch",
             "selected_process_tree_watch",
             "unknown"
           ]
         },
         "root_pid": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 0
         },
         "includes_descendants": {
           "type": "boolean",
-          "description": "Whether the selected collector scope is intended to include descendants; this is not proof that descendants existed or were observed."
+          "description": "Whether the selected collection recursively includes descendants in its scope (child processes or nested directories); this is not proof they existed or were observed."
         }
       },
       "additionalProperties": false
@@ -82,12 +93,16 @@
         },
         "collector_sources": {
           "type": "array",
-          "items": {"type": "string"},
+          "items": {
+            "type": "string"
+          },
           "uniqueItems": true
         },
         "limitations": {
           "type": "array",
-          "items": {"type": "string"}
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false
