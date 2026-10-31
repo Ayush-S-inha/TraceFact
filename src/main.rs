@@ -42,7 +42,7 @@ fn print_help() {
     println!("  tracefact help");
     println!();
     println!(
-        "The process command reads the selected Windows process tree, builds a Runtime Passport, and saves it locally."
+        "The process command snapshots the selected Windows process tree and its loaded modules, builds a Runtime Passport, and saves it locally."
     );
 }
 
@@ -55,13 +55,31 @@ fn run_process(pid: u32) -> Result<(), String> {
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0);
 
-        let events = collector.collect().map_err(|error| error.to_string())?;
+        let mut events = collector.collect().map_err(|error| error.to_string())?;
 
         if events.is_empty() {
             return Err(format!(
                 "TraceFact could not observe process {pid}. Check that the process exists."
             ));
         }
+
+        let process_count = events
+            .iter()
+            .filter(|event| event.source == "windows_process")
+            .count();
+        let module_events = collectors::windows_modules::collect_for_processes(&events, pid)
+            .map_err(|error| error.to_string())?;
+        let modules_observed = module_events
+            .iter()
+            .filter(|event| event.event_type == model::EventType::LibraryLoaded)
+            .count();
+        let inventory_complete = module_events
+            .iter()
+            .find(|event| event.event_type == model::EventType::LibraryInventoryStatus)
+            .and_then(|event| event.metadata.get("complete"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        events.extend(module_events);
 
         let application = events
             .iter()
@@ -88,7 +106,16 @@ fn run_process(pid: u32) -> Result<(), String> {
         println!();
         println!("  Root process:    {application}");
         println!("  Root PID:        {pid}");
-        println!("  Processes seen:  {}", snapshot.events.len());
+        println!("  Processes seen:  {process_count}");
+        println!("  Modules seen:    {modules_observed}");
+        println!(
+            "  Module coverage: {}",
+            if inventory_complete {
+                "complete"
+            } else {
+                "incomplete; inspect evidence summary"
+            }
+        );
         println!("  Saved locally:   yes");
         println!("  Database:        {}", database_path.display());
         println!("  Run ID:          {}", snapshot.snapshot_id);
@@ -1926,6 +1953,7 @@ fn main() -> ExitCode {
             println!("  Storage design:  SQLite");
             println!("  Network:         TCP metadata in process watch mode");
             println!("  Filesystem:      selected directory tree watch on Windows");
+            println!("  Loaded modules:  point-in-time Windows process snapshot");
             println!("  Payload capture: disabled");
             println!("  Telemetry:       disabled");
             println!("  AI:              optional / not required");

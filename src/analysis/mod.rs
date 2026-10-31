@@ -66,7 +66,7 @@ impl PassportAccumulator {
                     self.libraries.insert(target.clone());
                 }
             }
-            EventType::EnvironmentVariableUsed => {}
+            EventType::EnvironmentVariableUsed | EventType::LibraryInventoryStatus => {}
         }
     }
 
@@ -204,6 +204,9 @@ pub fn evidence_bundle_from_run(
     let is_filesystem_watch = collector_sources
         .iter()
         .any(|source| source == "windows_filesystem_watch");
+    let is_module_snapshot = collector_sources
+        .iter()
+        .any(|source| source == "windows_module_snapshot");
     let network_event_count = event_counts_by_type
         .get("network_connection")
         .copied()
@@ -281,9 +284,33 @@ pub fn evidence_bundle_from_run(
                 }
             }
         }
+    } else if is_module_snapshot {
+        limitations.push(
+            "Filesystem observation is limited to the separate selected-directory watch."
+                .to_string(),
+        );
+        limitations.push(
+            "Loaded modules are captured by a point-in-time Windows Toolhelp snapshot. Transient loads are not captured, inaccessible or exited processes and modules without resolved paths can be omitted from reliable comparison, and this inventory does not verify file hashes, signatures, versions, or trust.".to_string(),
+        );
+        if !library_inventory_complete(run) {
+            limitations.push(
+                "The loaded-module inventory summary reports incomplete coverage. Library comparison is skipped for this run.".to_string(),
+            );
+        }
+        if !is_watch {
+            limitations.push(
+                "This is a point-in-time process snapshot; network collection runs only in watch mode."
+                    .to_string(),
+            );
+        } else if network_event_count == 0 {
+            limitations.push(
+                "No network connection events were stored. This is not proof that no network activity occurred."
+                    .to_string(),
+            );
+        }
     } else {
         limitations.push(
-            "Filesystem observation is limited to the separate selected-directory watch, and loaded-library observation is not implemented in this checkpoint.".to_string(),
+            "Filesystem observation is limited to the separate selected-directory watch, and loaded-library observation was not captured in this run.".to_string(),
         );
         if !is_watch {
             limitations.push(
@@ -559,7 +586,28 @@ pub fn compare_baseline_to_run(
             limitations.push("Network-target comparisons were skipped because the stored collector provenance does not establish network observation coverage for both runs. A lack of stored network events is not proof that no network activity occurred.".to_string());
         }
         skipped_categories.push("files".to_string());
-        skipped_categories.push("libraries".to_string());
+
+        let libraries_comparable = baseline_scope.kind == "selected_process_tree_snapshot"
+            && current_scope.kind == "selected_process_tree_snapshot"
+            && baseline_sources.contains("windows_module_snapshot")
+            && current_sources.contains("windows_module_snapshot")
+            && library_inventory_complete(baseline_run)
+            && library_inventory_complete(current_run);
+        compare_observation_category(
+            &mut findings,
+            &mut compared_categories,
+            &mut skipped_categories,
+            "libraries",
+            &baseline_scope.platform,
+            &baseline.passport.observations.libraries,
+            &current_run.passport.observations.libraries,
+            libraries_comparable,
+            baseline_run,
+            current_run,
+        );
+        if skipped_categories.iter().any(|item| item == "libraries") {
+            limitations.push("Loaded-library comparison was skipped because one or both runs lack a complete point-in-time module inventory. Protected or exited processes and collector limits can leave gaps.".to_string());
+        }
     } else {
         skipped_categories.push("processes".to_string());
         skipped_categories.push("network_targets".to_string());
@@ -674,6 +722,27 @@ fn filesystem_coverage_complete(run: &StoredRun) -> bool {
     inventory_summary_seen && watch_summary_seen
 }
 
+fn library_inventory_complete(run: &StoredRun) -> bool {
+    let mut summaries = run.events.iter().filter(|event| {
+        event.source == "windows_module_snapshot"
+            && event.event_type == "library_inventory_status"
+            && event.subject.as_deref() == Some("inventory_summary")
+    });
+    let Some(summary) = summaries.next() else {
+        return false;
+    };
+    if summaries.next().is_some() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&summary.metadata_json) else {
+        return false;
+    };
+    metadata
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn has_process_provenance(sources: &[String]) -> bool {
     sources
         .iter()
@@ -768,12 +837,15 @@ fn observation_map(
 }
 
 fn comparison_key(category: &str, platform: &str, value: &str) -> String {
-    // Windows process names are case-insensitive, as are DNS names and hexadecimal
-    // letters in network endpoints. Keep exact comparison on other platforms.
+    // Windows paths and process names are case-insensitive. Network endpoints
+    // also normalize host casing. Keep exact comparison on other platforms.
     if platform == "windows"
-        && (category == "processes" || category == "network_targets" || category == "files")
+        && (category == "processes"
+            || category == "network_targets"
+            || category == "files"
+            || category == "libraries")
     {
-        value.to_lowercase()
+        value.replace('/', "\\").to_lowercase()
     } else {
         value.to_string()
     }
@@ -789,6 +861,10 @@ fn category_context_event_ids(run: &StoredRun, category: &str) -> Vec<String> {
                 event.event_type == "network_connection" || event.event_type == "dns_lookup"
             }
             "files" => event.event_type == "file_change" || event.event_type == "file_observed",
+            "libraries" => {
+                event.event_type == "library_loaded"
+                    || event.event_type == "library_inventory_status"
+            }
             _ => false,
         })
         .map(|event| event.event_id.clone())
@@ -824,6 +900,7 @@ fn matching_event_ids(
                 {
                     event.target.as_deref()
                 }
+                "libraries" if event.event_type == "library_loaded" => event.target.as_deref(),
                 _ => None,
             };
             value
@@ -973,7 +1050,7 @@ mod evidence_bundle_tests {
             .coverage
             .limitations
             .iter()
-            .any(|note| note.contains("not implemented")));
+            .any(|note| note.contains("loaded-library observation was not captured in this run")));
     }
 
     #[test]
@@ -1024,7 +1101,7 @@ mod evidence_bundle_tests {
             .coverage
             .limitations
             .iter()
-            .any(|item| item.contains("not implemented")));
+            .any(|item| item.contains("loaded-library observation was not captured in this run")));
     }
 
     #[test]
@@ -1341,6 +1418,124 @@ mod evidence_bundle_tests {
             .current_context_event_ids
             .contains(&"current-remove-old".to_string()));
         assert!(not_observed.explanation.contains("does not prove"));
+    }
+
+    fn sample_module_snapshot_run(run_id: &str, libraries: &[&str], complete: bool) -> StoredRun {
+        let mut run = sample_run("completed");
+        run.run_id = run_id.to_string();
+        run.started_at_ms = 1_000;
+        run.ended_at_ms = Some(2_000);
+        run.passport.passport_id = format!("passport-{run_id}");
+        run.passport.observations.network_targets.clear();
+        run.passport.observations.libraries =
+            libraries.iter().map(|path| (*path).to_string()).collect();
+        run.events
+            .retain(|event| event.event_type == "process_observed");
+        run.events[0].source = "windows_process".to_string();
+
+        for (index, path) in libraries.iter().enumerate() {
+            run.events.push(StoredEvent {
+                event_id: format!("{run_id}-module-{index}"),
+                timestamp_ms: 1_100 + index as i64,
+                event_type: "library_loaded".to_string(),
+                pid: Some(42),
+                executable: Some("demo.exe".to_string()),
+                subject: Some("loaded_module".to_string()),
+                target: Some((*path).to_string()),
+                metadata_json:
+                    r#"{"root_pid":42,"observation_method":"windows_toolhelp_module_snapshot"}"#
+                        .to_string(),
+                source: "windows_module_snapshot".to_string(),
+                sensitivity: "PotentiallySensitive".to_string(),
+            });
+        }
+        run.events.push(StoredEvent {
+            event_id: format!("{run_id}-module-summary"),
+            timestamp_ms: 1_999,
+            event_type: "library_inventory_status".to_string(),
+            pid: Some(42),
+            executable: Some("demo.exe".to_string()),
+            subject: Some("inventory_summary".to_string()),
+            target: None,
+            metadata_json: format!(
+                r#"{{"root_pid":42,"complete":{complete},"observed_modules":{}}}"#,
+                libraries.len()
+            ),
+            source: "windows_module_snapshot".to_string(),
+            sensitivity: "SystemMetadata".to_string(),
+        });
+        run
+    }
+
+    #[test]
+    fn complete_module_inventories_compare_with_event_links() {
+        let baseline_run = sample_module_snapshot_run(
+            "module-baseline",
+            &[r#"C:\Windows\System32\kernel32.dll"#, r#"C:\App\old.dll"#],
+            true,
+        );
+        let baseline = super::baseline_from_run(&baseline_run, "module stable", 3_000)
+            .expect("complete module snapshot should become a baseline");
+        let current_run = sample_module_snapshot_run(
+            "module-current",
+            &[r#"c:/windows/system32/KERNEL32.DLL"#, r#"C:\App\new.dll"#],
+            true,
+        );
+
+        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
+            .expect("complete module inventories should compare");
+        assert!(report
+            .compared_categories
+            .contains(&"libraries".to_string()));
+        let added = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.category == "libraries"
+                    && finding.kind == "added"
+                    && finding.observation.ends_with("new.dll")
+            })
+            .expect("new module should be reported");
+        assert!(added
+            .current_event_ids
+            .contains(&"module-current-module-1".to_string()));
+        let not_observed = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.category == "libraries"
+                    && finding.kind == "not_observed"
+                    && finding.observation.ends_with("old.dll")
+            })
+            .expect("baseline module should be marked not observed");
+        assert!(not_observed
+            .baseline_event_ids
+            .contains(&"module-baseline-module-1".to_string()));
+        assert!(not_observed.explanation.contains("does not prove"));
+        assert!(not_observed
+            .current_context_event_ids
+            .contains(&"module-current-module-summary".to_string()));
+    }
+
+    #[test]
+    fn incomplete_module_inventory_is_not_compared() {
+        let baseline_run =
+            sample_module_snapshot_run("module-baseline", &[r#"C:\App\old.dll"#], true);
+        let baseline = super::baseline_from_run(&baseline_run, "module stable", 3_000)
+            .expect("complete module snapshot should become a baseline");
+        let current_run = sample_module_snapshot_run("module-current", &[], false);
+
+        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
+            .expect("incomplete inventory should produce a limited report");
+        assert!(report.skipped_categories.contains(&"libraries".to_string()));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.category == "libraries"));
+        assert!(report
+            .limitations
+            .iter()
+            .any(|item| item.contains("complete point-in-time module inventory")));
     }
 
     #[test]
