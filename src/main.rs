@@ -5,6 +5,11 @@ mod storage;
 
 use std::env;
 use std::process::ExitCode;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+#[cfg(windows)]
+static RUN_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
 use crate::collectors::Collector;
@@ -30,6 +35,7 @@ fn print_help() {
     println!("  tracefact process <pid>");
     println!("  tracefact watch <pid>");
     println!("  tracefact watch-files <directory> [duration_seconds]");
+    println!("    Quote directory paths that contain spaces.");
     println!("  tracefact history");
     println!("  tracefact inspect <run_id>");
     println!("  tracefact inspect latest");
@@ -42,7 +48,7 @@ fn print_help() {
     println!("  tracefact help");
     println!();
     println!(
-        "The process command snapshots the selected Windows process tree and its loaded modules, builds a Runtime Passport, and saves it locally."
+        "The process command records the selected Windows process tree and its loaded modules, creates a Runtime Passport, and saves both locally."
     );
 }
 
@@ -50,16 +56,13 @@ fn run_process(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
         let mut collector = collectors::windows_process::WindowsProcessCollector::new(pid);
-        let started_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or(0);
+        let (started_at_ms, snapshot_id) = new_run_identity("snap", None)?;
 
         let mut events = collector.collect().map_err(|error| error.to_string())?;
 
         if events.is_empty() {
             return Err(format!(
-                "TraceFact could not observe process {pid}. Check that the process exists."
+                "No process events were collected for PID {pid}. Check that the process still exists."
             ));
         }
 
@@ -80,6 +83,11 @@ fn run_process(pid: u32) -> Result<(), String> {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         events.extend(module_events);
+        for (index, event) in events.iter_mut().enumerate() {
+            let sequence = u64::try_from(index)
+                .map_err(|_| "Process snapshot exceeds the event sequence range.".to_string())?;
+            event.id = run_event_id(&snapshot_id, sequence);
+        }
 
         let application = events
             .iter()
@@ -87,15 +95,16 @@ fn run_process(pid: u32) -> Result<(), String> {
             .map(|event| event.process.executable.clone())
             .unwrap_or_else(|| format!("pid:{pid}"));
 
+        let ended_at_ms = current_unix_ms()?;
         let snapshot = model::RuntimeSnapshot {
             schema_version: "0.1".to_string(),
-            snapshot_id: format!("snap-{started_at_ms}"),
+            snapshot_id: snapshot_id.clone(),
             application: application.clone(),
             started_at_ms,
-            ended_at_ms: Some(started_at_ms),
+            ended_at_ms: Some(ended_at_ms),
             events,
         };
-        let passport = analysis::passport_from_snapshot(&snapshot, started_at_ms);
+        let passport = analysis::passport_from_snapshot(&snapshot, ended_at_ms);
 
         let (mut connection, database_path) =
             storage::open_default().map_err(|error| error.to_string())?;
@@ -113,7 +122,7 @@ fn run_process(pid: u32) -> Result<(), String> {
             if inventory_complete {
                 "complete"
             } else {
-                "incomplete; inspect evidence summary"
+                "incomplete; review the evidence summary"
             }
         );
         println!("  Saved locally:   yes");
@@ -132,7 +141,7 @@ fn run_process(pid: u32) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = pid;
-        return Err("The Windows process collector is available only on Windows.".to_string());
+        return Err("The Windows process collector runs only on Windows.".to_string());
     }
 
     Ok(())
@@ -229,9 +238,9 @@ fn persist_network_observation(
     let destination = SocketAddr::new(observation.destination_ip, observation.destination_port);
     let flow_key = NetworkFlowKey::new(observation.process_id, source, destination);
 
-    // A disconnect notification can arrive after the process exit notification.
-    // Prefer the identity saved with this exact flow so the event is not lost
-    // simply because the process was already removed from the active tree.
+    // Windows can report a disconnect after the process exit event. Use the
+    // identity stored with this flow because the active process entry may
+    // already have been removed.
     let cached_disconnect_process =
         cached_process_for_disconnect(observation.operation, &flow_key, flow_targets);
 
@@ -252,7 +261,8 @@ fn persist_network_observation(
             .is_some_and(|expires_at| *expires_at > now)
         {
             return Ok(NetworkPersistOutcome::AttributionUnavailable(
-                "A recent process snapshot failed, so membership remains unverified.".to_string(),
+                "A recent process snapshot failed. Tree membership is still unverified."
+                    .to_string(),
             ));
         }
 
@@ -262,8 +272,8 @@ fn persist_network_observation(
         ) {
             Ok(member) => member,
             Err(error) => {
-                // A transient process snapshot failure must not abort the entire watch.
-                // Cache the failure briefly to avoid repeating a system snapshot for every event.
+                // A temporary tree snapshot error must not stop the watch.
+                // Cache the PID briefly to avoid repeating the same lookup for every event.
                 if unresolved_pids_until.len() < 4096 {
                     unresolved_pids_until
                         .insert(observation.process_id, now + NEGATIVE_PID_CACHE_TTL);
@@ -318,14 +328,16 @@ fn persist_network_observation(
         NetworkOperation::Disconnect => flow_targets.remove(&flow_key).map(|flow| flow.target),
     };
 
-    let next_sequence = (*sequence).wrapping_add(1);
+    let next_sequence = (*sequence)
+        .checked_add(1)
+        .ok_or_else(|| "Network event sequence exhausted.".to_string())?;
     let relationship = if observation.process_id == root_pid {
         "root"
     } else {
         "child"
     };
     let runtime_event = model::RuntimeEvent {
-        id: format!("{run_id}-event-{next_sequence}"),
+        id: run_event_id(run_id, next_sequence),
         timestamp_ms: observation.timestamp_ms,
         event_type: model::EventType::NetworkConnection,
         process: model::ProcessIdentity {
@@ -405,8 +417,7 @@ fn drain_network_queue(
     use collectors::windows_network::NetworkWatchMessage;
     use std::sync::mpsc::TryRecvError;
 
-    // Yield back to the process-event watcher regularly, even if ETW keeps
-    // producing records while this queue is being drained.
+    // Limit each pass so a busy ETW queue cannot starve process lifecycle events.
     const MAX_MESSAGES_PER_DRAIN: usize = 1024;
 
     let mut first_error = None;
@@ -434,15 +445,15 @@ fn drain_network_queue(
                             sequence,
                         )? {
                             NetworkPersistOutcome::Saved => {
-                                *network_events_saved = (*network_events_saved).wrapping_add(1);
+                                *network_events_saved = (*network_events_saved).saturating_add(1);
                             }
                             NetworkPersistOutcome::Filtered => {
                                 *network_events_filtered =
-                                    (*network_events_filtered).wrapping_add(1);
+                                    (*network_events_filtered).saturating_add(1);
                             }
                             NetworkPersistOutcome::AttributionUnavailable(message) => {
                                 *network_attribution_failures =
-                                    (*network_attribution_failures).wrapping_add(1);
+                                    (*network_attribution_failures).saturating_add(1);
                                 if first_attribution_error.is_none() {
                                     *first_attribution_error = Some(message);
                                 }
@@ -480,26 +491,22 @@ fn run_watch(pid: u32) -> Result<(), String> {
         WindowsProcessEventWatcher,
     };
 
-    let started_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let run_id = format!("watch-{started_at_ms}-{pid}");
+    let (started_at_ms, run_id) = new_run_identity("watch", Some(pid))?;
 
-    // Install Ctrl+C handling before any run record is created. A handler setup
-    // failure must not leave an unfinished run in the database.
+    // Register Ctrl+C before creating the run record. A handler setup error
+    // must leave the database without an unfinished watch.
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop_requested);
     ctrlc::set_handler(move || {
         stop_handler.store(true, Ordering::SeqCst);
     })
-    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
+    .map_err(|error| format!("Ctrl+C handler setup: {error}"))?;
 
     let (mut connection, database_path) =
         storage::open_default().map_err(|error| error.to_string())?;
 
-    // Start ETW first so failures to start it do not leave the WMI watcher
-    // threads running in the background without a consumer.
+    // Start ETW before the WMI process watchers. If ETW startup fails, no
+    // process watcher threads have started and no event consumer is needed.
     let mut network_watcher =
         WindowsNetworkEventWatcher::start().map_err(|error| error.to_string())?;
     let watcher = WindowsProcessEventWatcher::start();
@@ -571,11 +578,14 @@ fn run_watch(pid: u32) -> Result<(), String> {
                     .metadata
                     .get("depth")
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as u32,
+                    .and_then(|depth| u32::try_from(depth).ok())
+                    .unwrap_or(0),
             },
         );
         passport.observe(&event);
-        sequence = sequence.wrapping_add(1);
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "Process event sequence exhausted.".to_string())?;
     }
 
     println!("TraceFact process watch");
@@ -593,7 +603,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
     let mut process_events_drained_after_stop = 0_usize;
     let mut process_events_discarded_at_stop = 0_usize;
     let mut process_queue_drain_limited = false;
-    let mut stop_reason = "stopped by user";
+    let mut stop_reason: Option<&'static str> = None;
     let mut network_error = None;
 
     let watch_result = (|| -> Result<(), String> {
@@ -619,7 +629,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
                 &mut first_attribution_error,
             )? {
                 network_error = Some(message);
-                stop_reason = "network observer stopped";
+                stop_reason = Some("network observer stopped");
                 break 'watch;
             }
 
@@ -684,7 +694,9 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         continue 'watch;
                     }
 
-                    let next_sequence = sequence.wrapping_add(1);
+                    let next_sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| "Process event sequence exhausted.".to_string())?;
                     let runtime_event = build_process_lifecycle_event(
                         &run_id,
                         next_sequence,
@@ -717,15 +729,16 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         continue 'watch;
                     };
 
-                    // The stop notification identifies the process by PID and name.
-                    // ParentProcessId is not required to match the bootstrap record,
-                    // especially for the root process where Windows may report a
-                    // different or unavailable parent at exit time.
+                    // Windows identifies the exit by PID and name. ParentProcessId
+                    // may differ from the initial snapshot or be unavailable,
+                    // particularly for the root process.
                     if previous.name != event.process_name {
                         continue 'watch;
                     }
 
-                    let next_sequence = sequence.wrapping_add(1);
+                    let next_sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| "Process event sequence exhausted.".to_string())?;
                     let relationship = if event.process_id == pid {
                         "root"
                     } else {
@@ -753,7 +766,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
                     );
 
                     if event.process_id == pid {
-                        stop_reason = "root process exited";
+                        stop_reason = Some("root process exited");
                         break 'watch;
                     }
                 }
@@ -770,7 +783,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
     })();
 
     if let Err(message) = watch_result {
-        stop_reason = "watch interrupted by error";
+        stop_reason = Some("watch interrupted by error");
         match &mut network_error {
             Some(existing) if existing != &message => {
                 existing.push_str("; additional watch error: ");
@@ -822,6 +835,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
         network_error = network_diagnostics.stream_error.clone();
     }
 
+    let stop_reason = stop_reason.unwrap_or("stopped by user");
     let terminal_status = if network_error.is_some() {
         "failed"
     } else if stop_reason == "root process exited" {
@@ -829,7 +843,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
     } else {
         "interrupted"
     };
-    let ended_at_ms = collectors::windows_process::WindowsProcessCollector::now_ms();
+    let ended_at_ms = current_unix_ms()?;
     let final_passport = passport.finish(&run_id, ended_at_ms, &application);
     storage::finish_run_with_status(
         &mut connection,
@@ -897,7 +911,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
             }
             if network_diagnostics.additional_shape_event_count > 0 {
                 println!(
-                    "    Records belonging to additional event shapes: {}",
+                    "    Records from additional event shapes: {}",
                     network_diagnostics.additional_shape_event_count
                 );
             }
@@ -1043,14 +1057,14 @@ fn run_export(run_id: &str, output_path: &str) -> Result<(), String> {
         .map_err(|error| format!("Could not serialize evidence bundle: {error}"))?;
     let path = std::path::Path::new(output_path);
 
-    // Never overwrite an existing evidence file without an explicit user action.
+    // Refuse to overwrite an existing evidence file.
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|error| {
             format!(
-                "Could not create export at {} (existing files are not overwritten): {error}",
+                "Could not create export at {}. Existing files are left untouched: {error}",
                 path.display()
             )
         })?;
@@ -1070,10 +1084,8 @@ fn run_export(run_id: &str, output_path: &str) -> Result<(), String> {
     println!("  Database:        {}", database_path.display());
     println!("  Exported to:     {}", path.display());
     println!();
-    println!("Review the exported file before sharing it. Event metadata may contain process IDs,");
-    println!(
-        "executable names, and network endpoints. Raw application payloads are not collected."
-    );
+    println!("Check the exported file before sharing it. Event metadata may include process IDs,");
+    println!("executable names, and network endpoints. Application payloads are not collected.");
     Ok(())
 }
 
@@ -1084,6 +1096,51 @@ fn current_unix_ms() -> Result<i64, String> {
         .as_millis()
         .try_into()
         .map_err(|_| "Timestamp is outside the supported range.".to_string())
+}
+
+#[cfg(windows)]
+fn new_run_identity(prefix: &str, owner_pid: Option<u32>) -> Result<(i64, String), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("System clock is before the Unix epoch: {error}"))?;
+    let started_at_ms = i64::try_from(now.as_millis())
+        .map_err(|_| "Timestamp is outside the supported range.".to_string())?;
+    let sub_millisecond = now.subsec_nanos() % 1_000_000;
+    let sequence = RUN_ID_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let process_id = std::process::id();
+
+    let run_id = match owner_pid {
+        Some(owner_pid) => format!(
+            "{prefix}-{started_at_ms}-{sub_millisecond}-{owner_pid}-{process_id}-{sequence}"
+        ),
+        None => format!("{prefix}-{started_at_ms}-{sub_millisecond}-{process_id}-{sequence}"),
+    };
+
+    Ok((started_at_ms, run_id))
+}
+
+fn run_event_id(run_id: &str, sequence: u64) -> String {
+    format!("{run_id}-event-{sequence}")
+}
+
+fn parse_pid(value: &str) -> Result<u32, String> {
+    let pid = value
+        .parse::<u32>()
+        .map_err(|_| "PID must be a positive 32-bit integer.".to_string())?;
+    if pid == 0 {
+        return Err("PID must be greater than zero.".to_string());
+    }
+    Ok(pid)
+}
+
+fn parse_duration(value: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "Duration must be a positive number of seconds.".to_string())?;
+    if seconds == 0 {
+        return Err("Duration must be greater than zero seconds.".to_string());
+    }
+    Ok(seconds)
 }
 
 fn run_baseline_save(name: &str, run_id: &str) -> Result<(), String> {
@@ -1116,9 +1173,9 @@ fn run_baseline_save(name: &str, run_id: &str) -> Result<(), String> {
     println!("  Database:      {}", database_path.display());
     println!();
     println!(
-        "The baseline is local. Its name is unique (case-insensitive) and will not be overwritten."
+        "The baseline stays local. Names are unique, case-insensitive, and are never overwritten."
     );
-    println!("Inspect coverage limitations before using it as an expected-behavior reference.");
+    println!("Review coverage limits before treating it as an expected-behavior reference.");
     Ok(())
 }
 
@@ -1212,7 +1269,7 @@ fn run_baseline_export(name: &str, output_path: &str) -> Result<(), String> {
         .open(path)
         .map_err(|error| {
             format!(
-                "Could not create baseline export at {} (existing files are not overwritten): {error}",
+                "Could not create baseline export at {}. Existing files are left untouched: {error}",
                 path.display()
             )
         })?;
@@ -1231,7 +1288,7 @@ fn run_baseline_export(name: &str, output_path: &str) -> Result<(), String> {
     println!("  Database:      {}", database_path.display());
     println!("  Exported to:   {}", path.display());
     println!();
-    println!("Review the file before sharing it; the scope and Passport may contain process IDs, process names, and network endpoints.");
+    println!("Review the file before sharing it. The scope and Passport may contain process IDs, process names, and network endpoints.");
     Ok(())
 }
 
@@ -1253,7 +1310,7 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
         })?;
     if baseline_run.status != "completed" {
         return Err(format!(
-            "Baseline source run '{}' is no longer completed; refusing to compare against it.",
+            "Baseline source run '{}' is not completed. Comparison stopped.",
             baseline.source_run_id
         ));
     }
@@ -1313,10 +1370,10 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
     println!();
     if !report.comparable {
         println!(
-            "No behavior-set findings were generated because the observation scopes do not match."
+            "No findings were generated because the baseline and current observation scopes differ."
         );
     } else if report.compared_categories.is_empty() {
-        println!("No behavior-set findings were generated because no category had sufficient stored provenance.");
+        println!("No findings were generated because no category had enough stored provenance.");
     } else if report.findings.is_empty() {
         println!("No set differences were found in the comparable observation categories.");
     } else {
@@ -1392,7 +1449,7 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
         println!("  - {limitation}");
     }
     println!();
-    println!("A difference is a deterministic result from stored observations, not proof of malicious behavior.");
+    println!("Differences reflect stored observations. They do not establish malicious behavior.");
 
     if let Some(output_path) = output_path {
         let json = serde_json::to_vec_pretty(&report)
@@ -1403,7 +1460,7 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
             .create_new(true)
             .open(path)
             .map_err(|error| format!(
-                "Could not create comparison report at {} (existing files are not overwritten): {error}",
+                "Could not create comparison report at {}. Existing files are left untouched: {error}",
                 path.display()
             ))?;
         if let Err(error) = file.write_all(&json).and_then(|_| file.write_all(b"\n")) {
@@ -1412,7 +1469,9 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
             return Err(format!("Could not write comparison report: {error}"));
         }
         println!("Comparison report exported to: {}", path.display());
-        println!("Inspect the report before sharing it; it contains local process and endpoint metadata.");
+        println!(
+            "Review the report before sharing it. It contains local process and endpoint metadata."
+        );
     }
 
     Ok(())
@@ -1422,23 +1481,26 @@ fn run_compare(baseline_name: &str, run_id: &str, output_path: Option<&str>) -> 
 fn filesystem_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
 }
 
 #[cfg(windows)]
 fn filesystem_snapshot_event(
+    run_id: &str,
     started_at_ms: i64,
     sequence: u64,
     root: &std::path::Path,
     entry: &collectors::windows_filesystem::InventoryEntry,
 ) -> model::RuntimeEvent {
     model::RuntimeEvent {
-        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        id: run_event_id(run_id, sequence),
         timestamp_ms: started_at_ms,
         event_type: model::EventType::FileObserved,
         process: model::ProcessIdentity {
-            // PID 0 is a sentinel: notify does not identify the process responsible for a change.
+            // notify does not identify the process behind a path change. PID 0
+            // marks process attribution as unavailable.
             pid: 0,
             executable: "filesystem-observer".to_string(),
             command_line: None,
@@ -1459,13 +1521,14 @@ fn filesystem_snapshot_event(
 
 #[cfg(windows)]
 fn filesystem_inventory_summary_event(
+    run_id: &str,
     started_at_ms: i64,
     sequence: u64,
     root: &std::path::Path,
     inventory: &collectors::windows_filesystem::InitialInventory,
 ) -> model::RuntimeEvent {
     model::RuntimeEvent {
-        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        id: run_event_id(run_id, sequence),
         timestamp_ms: started_at_ms,
         event_type: model::EventType::FileObserved,
         process: model::ProcessIdentity {
@@ -1492,13 +1555,13 @@ fn filesystem_inventory_summary_event(
 
 #[cfg(windows)]
 fn filesystem_change_event(
-    started_at_ms: i64,
+    run_id: &str,
     sequence: u64,
     root: &std::path::Path,
     observation: collectors::windows_filesystem::FileSystemObservation,
 ) -> model::RuntimeEvent {
     model::RuntimeEvent {
-        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        id: run_event_id(run_id, sequence),
         timestamp_ms: filesystem_now_ms(),
         event_type: model::EventType::FileChange,
         process: model::ProcessIdentity {
@@ -1523,7 +1586,7 @@ fn filesystem_change_event(
 
 #[cfg(windows)]
 fn filesystem_watch_summary_event(
-    started_at_ms: i64,
+    run_id: &str,
     sequence: u64,
     root: &std::path::Path,
     inventory: &collectors::windows_filesystem::InitialInventory,
@@ -1532,7 +1595,7 @@ fn filesystem_watch_summary_event(
     filesystem_coverage_requires_review: bool,
 ) -> model::RuntimeEvent {
     model::RuntimeEvent {
-        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        id: run_event_id(run_id, sequence),
         timestamp_ms: filesystem_now_ms(),
         event_type: model::EventType::FileChange,
         process: model::ProcessIdentity {
@@ -1562,7 +1625,7 @@ fn filesystem_watch_summary_event(
 
 #[cfg(windows)]
 fn filesystem_notification_gap_event(
-    started_at_ms: i64,
+    run_id: &str,
     sequence: u64,
     root: &std::path::Path,
     notify_event: &notify::Event,
@@ -1574,7 +1637,7 @@ fn filesystem_notification_gap_event(
         .map(|path| path.to_string_lossy().replace('\\', "/"))
         .collect();
     model::RuntimeEvent {
-        id: format!("fsobs-{started_at_ms}-{sequence}"),
+        id: run_event_id(run_id, sequence),
         timestamp_ms: filesystem_now_ms(),
         event_type: model::EventType::FileChange,
         process: model::ProcessIdentity {
@@ -1591,7 +1654,7 @@ fn filesystem_notification_gap_event(
             "reported_relative_paths": relative_paths,
             "watch_root": root.to_string_lossy(),
             "process_attribution": "not_available",
-            "reason": "The notification backend reported an unclassified or rescan event; complete path-level change details are not available."
+            "reason": "The notification backend reported an unclassified or rescan event. Individual path changes are unavailable."
         }),
         source: "windows_filesystem_watch".to_string(),
         sensitivity: model::Sensitivity::SystemMetadata,
@@ -1614,37 +1677,40 @@ fn persist_filesystem_notification(
         &notify_event.kind,
         notify::EventKind::Any | notify::EventKind::Other
     ) {
-        // notify can emit an Other/Rescan event when the operating system no longer has a
-        // complete list of individual changes. Record the gap and block clean file comparison.
+        // notify may send Other/Rescan when the backend cannot enumerate
+        // individual changes. Store the gap and flag the run for comparison.
         *filesystem_coverage_requires_review = true;
-        let gap_event =
-            filesystem_notification_gap_event(started_at_ms, *sequence, root, notify_event);
+        let gap_event = filesystem_notification_gap_event(run_id, *sequence, root, notify_event);
         storage::append_event(connection, run_id, &gap_event)
             .map_err(|error| format!("Could not save filesystem coverage-gap event: {error}"))?;
         passport.observe(&gap_event);
-        *sequence = sequence.saturating_add(1);
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "Filesystem event sequence exhausted.".to_string())?;
         saved = saved.saturating_add(1);
     }
     let observations = collectors::windows_filesystem::observations_from_event(notify_event, root);
     for observation in observations {
-        // Windows commonly emits rename-from and rename-to as two separate notifications.
-        // Those are applied in order by the Passport accumulator; only an explicitly ambiguous
-        // single-path rename forces the filesystem coverage check to fail.
+        // Windows may send rename-from and rename-to as separate notifications.
+        // The Passport accumulator applies them in order. A single-path rename
+        // remains ambiguous and marks filesystem coverage for review.
         let rename_is_ambiguous = observation.operation == "renamed";
         let directory_may_have_descendants =
             matches!(observation.operation, "created" | "renamed_to")
                 && !matches!(observation.entry_kind, "file" | "symlink");
         if rename_is_ambiguous || directory_may_have_descendants {
-            // Directory moves/creates may carry descendants that the notification backend does
-            // not enumerate individually. An ambiguous rename may not identify both paths.
-            // Keep the evidence, but don't use it for a clean diff.
+            // A directory move or create may affect descendants that the backend
+            // does not report individually. A single-path rename may omit one path.
+            // Retain the event, but do not treat the file diff as complete.
             *filesystem_coverage_requires_review = true;
         }
-        let event = filesystem_change_event(started_at_ms, *sequence, root, observation);
+        let event = filesystem_change_event(run_id, *sequence, root, observation);
         storage::append_event(connection, run_id, &event)
             .map_err(|error| format!("Could not save filesystem observation: {error}"))?;
         passport.observe(&event);
-        *sequence = sequence.saturating_add(1);
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "Filesystem event sequence exhausted.".to_string())?;
         saved = saved.saturating_add(1);
     }
     Ok(saved)
@@ -1661,12 +1727,8 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
         return Err("The watch duration must be greater than zero seconds.".to_string());
     }
 
-    let root = std::fs::canonicalize(directory).map_err(|error| {
-        format!(
-            "Could not resolve selected directory '{}': {error}",
-            directory
-        )
-    })?;
+    let root = std::fs::canonicalize(directory)
+        .map_err(|error| format!("Could not resolve directory '{}': {error}", directory))?;
     if !root.is_dir() {
         return Err(format!(
             "Selected path is not a directory: {}",
@@ -1679,37 +1741,34 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
     ctrlc::set_handler(move || {
         stop_handler.store(true, Ordering::SeqCst);
     })
-    .map_err(|error| format!("Could not install Ctrl+C handler: {error}"))?;
+    .map_err(|error| format!("Ctrl+C handler setup: {error}"))?;
 
-    // Start notifications before taking the initial inventory to reduce the observation gap.
+    // Start notifications before inventory. Events raised during the scan
+    // can then wait in the watcher queue.
     let mut watcher =
         WindowsFileSystemEventWatcher::start(&root).map_err(|error| error.to_string())?;
     let receiver = watcher
         .take_receiver()
         .ok_or_else(|| "Filesystem watcher receiver was already taken.".to_string())?;
     let inventory = initial_inventory(&root);
-    let started_at_ms = filesystem_now_ms();
-    let run_id = format!("filesystem-{started_at_ms}-{}", std::process::id());
+    let (started_at_ms, run_id) = new_run_identity("filesystem", Some(std::process::id()))?;
     let application = format!("directory:{}", root.display());
 
     let mut initial_events = Vec::with_capacity(inventory.entries.len().saturating_add(1));
     let mut sequence = 0_u64;
     for entry in &inventory.entries {
-        initial_events.push(filesystem_snapshot_event(
-            started_at_ms,
-            sequence,
-            &root,
-            entry,
-        ));
-        sequence = sequence.saturating_add(1);
+        let event = filesystem_snapshot_event(&run_id, started_at_ms, sequence, &root, entry);
+        initial_events.push(event);
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "Filesystem event sequence exhausted.".to_string())?;
     }
-    initial_events.push(filesystem_inventory_summary_event(
-        started_at_ms,
-        sequence,
-        &root,
-        &inventory,
-    ));
-    sequence = sequence.saturating_add(1);
+    let inventory_summary =
+        filesystem_inventory_summary_event(&run_id, started_at_ms, sequence, &root, &inventory);
+    initial_events.push(inventory_summary);
+    sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| "Filesystem event sequence exhausted.".to_string())?;
 
     let (mut connection, database_path) =
         storage::open_default().map_err(|error| error.to_string())?;
@@ -1755,30 +1814,28 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
         None => println!("  Duration:                 until Ctrl+C"),
     }
     println!();
-    println!(
-        "Recording create, modify, rename, and remove notifications. Press Ctrl+C to stop early."
-    );
+    println!("Recording file create, modify, rename, and remove events. Press Ctrl+C to stop.");
 
     let watch_started = std::time::Instant::now();
-    let mut stop_reason = "stopped by user";
+    let mut stop_reason: Option<&'static str> = None;
     let mut watch_error: Option<String> = None;
     let mut changes_saved = 0_u64;
     let mut filesystem_coverage_requires_review = false;
 
     'watch: loop {
         if stop_requested.load(Ordering::SeqCst) {
-            stop_reason = "stopped by user";
+            stop_reason = Some("stopped by user");
             break;
         }
         if let Some(seconds) = duration_seconds {
             if watch_started.elapsed() >= std::time::Duration::from_secs(seconds) {
-                stop_reason = "duration elapsed";
+                stop_reason = Some("duration elapsed");
                 break;
             }
         }
         if let Some(error) = watcher.first_error() {
             watch_error = Some(error);
-            stop_reason = "filesystem notification error";
+            stop_reason = Some("filesystem notification error");
             break;
         }
 
@@ -1797,7 +1854,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
                     Ok(saved) => changes_saved = changes_saved.saturating_add(saved as u64),
                     Err(error) => {
                         watch_error = Some(error);
-                        stop_reason = "storage error";
+                        stop_reason = Some("storage error");
                         break 'watch;
                     }
                 }
@@ -1806,7 +1863,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 watch_error =
                     Some("Filesystem notification queue disconnected unexpectedly.".to_string());
-                stop_reason = "notification queue disconnected";
+                stop_reason = Some("notification queue disconnected");
                 break;
             }
         }
@@ -1816,13 +1873,13 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
     if watch_error.is_none() {
         watch_error = watcher.first_error();
         if watch_error.is_some() {
-            stop_reason = "filesystem notification error";
+            stop_reason = Some("filesystem notification error");
         }
     }
     let dropped_events = watcher.dropped_events();
 
-    // Drain already-queued callbacks after stopping the native watcher. The channel is bounded,
-    // so this drain is finite and does not continue listening for new notifications.
+    // The native watcher has stopped. Drain callbacks already in the bounded
+    // channel; no new notifications can enter after this point.
     loop {
         match receiver.try_recv() {
             Ok(FileSystemWatchMessage::Event(notify_event)) => {
@@ -1840,7 +1897,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
                     Err(error) => {
                         if watch_error.is_none() {
                             watch_error = Some(error);
-                            stop_reason = "storage error while draining queued events";
+                            stop_reason = Some("storage error while draining queued events");
                         }
                         break;
                     }
@@ -1851,7 +1908,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
     }
 
     let summary_event = filesystem_watch_summary_event(
-        started_at_ms,
+        &run_id,
         sequence,
         &root,
         &inventory,
@@ -1864,13 +1921,16 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
             watch_error = Some(format!(
                 "Could not save filesystem coverage summary: {error}"
             ));
-            stop_reason = "summary persistence error";
+            stop_reason = Some("summary persistence error");
         }
     } else {
         passport.observe(&summary_event);
-        sequence = sequence.saturating_add(1);
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| "Filesystem event sequence exhausted.".to_string())?;
     }
 
+    let stop_reason = stop_reason.unwrap_or("stopped by user");
     let terminal_status = if watch_error.is_some() {
         "failed"
     } else if stop_reason == "duration elapsed" {
@@ -1878,7 +1938,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
     } else {
         "interrupted"
     };
-    let ended_at_ms = filesystem_now_ms();
+    let ended_at_ms = current_unix_ms()?;
     let final_passport = passport.finish(&run_id, ended_at_ms, &application);
     storage::finish_run_with_status(
         &mut connection,
@@ -1906,7 +1966,7 @@ fn run_watch_files(directory: &str, duration_seconds: Option<u64>) -> Result<(),
     }
     println!("  Run ID:                 {run_id}");
     println!();
-    println!("No process-level file attribution is available in this collector. Review coverage before comparing this run.");
+    println!("This collector cannot attribute file changes to a process. Review coverage before comparing this run.");
 
     if let Some(error) = watch_error {
         return Err(format!(
@@ -1944,10 +2004,20 @@ fn run_history(limit: u32) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
+    let mut arguments = env::args().skip(1);
+    let command = arguments.next();
+    let args: Vec<String> = arguments.collect();
 
-    match args.next().as_deref() {
-        Some("doctor") => {
+    match command.as_deref() {
+        None => {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        Some("help") | Some("--help") | Some("-h") if args.is_empty() => {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        Some("doctor") if args.is_empty() => {
             println!("TraceFact doctor");
             println!("  Core:            ready");
             println!("  Storage design:  SQLite");
@@ -1959,7 +2029,7 @@ fn main() -> ExitCode {
             println!("  AI:              optional / not required");
             ExitCode::SUCCESS
         }
-        Some("demo") => {
+        Some("demo") if args.is_empty() => {
             let passport = collectors::demo::build_demo_passport();
             match serde_json::to_string_pretty(&passport) {
                 Ok(json) => {
@@ -1972,54 +2042,41 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("watch") => match args.next().and_then(|value| value.parse::<u32>().ok()) {
-            Some(pid) => {
-                #[cfg(windows)]
-                {
-                    match run_watch(pid) {
-                        Ok(()) => ExitCode::SUCCESS,
-                        Err(error) => {
-                            eprintln!("TraceFact could not watch process {pid}: {error}");
-                            ExitCode::FAILURE
+        Some("watch") => match args.as_slice() {
+            [value] => match parse_pid(value) {
+                Ok(pid) => {
+                    #[cfg(windows)]
+                    {
+                        match run_watch(pid) {
+                            Ok(()) => ExitCode::SUCCESS,
+                            Err(error) => {
+                                eprintln!("TraceFact could not watch process {pid}: {error}");
+                                ExitCode::FAILURE
+                            }
                         }
                     }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = pid;
+                        eprintln!("The Windows process watcher runs only on Windows.");
+                        ExitCode::FAILURE
+                    }
                 }
-                #[cfg(not(windows))]
-                {
-                    let _ = pid;
-                    eprintln!("The Windows process watcher is available only on Windows.");
+                Err(error) => {
+                    eprintln!("TraceFact could not watch process: {error}");
                     ExitCode::FAILURE
                 }
-            }
-            None => {
+            },
+            _ => {
                 eprintln!("Usage: tracefact watch <pid>");
                 ExitCode::FAILURE
             }
         },
-        Some("watch-files") => {
-            let remaining: Vec<String> = args.collect();
-            if remaining.is_empty() {
-                eprintln!("Usage: tracefact watch-files <directory> [duration_seconds]");
-                ExitCode::FAILURE
-            } else {
-                // A numeric final argument is treated as duration. Quote directory paths that
-                // contain spaces so they remain one argument.
-                let mut parts = remaining;
-                let duration_seconds = if parts.len() >= 2 {
-                    parts
-                        .last()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .map(|duration| {
-                            parts.pop();
-                            duration
-                        })
-                } else {
-                    None
-                };
-                let directory = parts.join(" ");
+        Some("watch-files") => match args.as_slice() {
+            [directory] => {
                 #[cfg(windows)]
                 {
-                    match run_watch_files(&directory, duration_seconds) {
+                    match run_watch_files(directory.as_str(), None) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(error) => {
                             eprintln!("TraceFact filesystem watch failed: {error}");
@@ -2029,40 +2086,77 @@ fn main() -> ExitCode {
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = (directory, duration_seconds);
-                    eprintln!("The selected-directory filesystem watcher is currently available only on Windows.");
+                    let _ = directory;
+                    eprintln!("The selected-directory filesystem watcher runs only on Windows.");
                     ExitCode::FAILURE
                 }
             }
-        }
-        Some("process") => match args.next().and_then(|value| value.parse::<u32>().ok()) {
-            Some(pid) => match run_process(pid) {
-                Ok(()) => ExitCode::SUCCESS,
+            [directory, duration] => match parse_duration(duration) {
+                Ok(seconds) => {
+                    #[cfg(windows)]
+                    {
+                        match run_watch_files(directory.as_str(), Some(seconds)) {
+                            Ok(()) => ExitCode::SUCCESS,
+                            Err(error) => {
+                                eprintln!("TraceFact filesystem watch failed: {error}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = (directory, seconds);
+                        eprintln!(
+                            "The selected-directory filesystem watcher runs only on Windows."
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
                 Err(error) => {
-                    eprintln!("TraceFact could not observe process {pid}: {error}");
+                    eprintln!("TraceFact filesystem watch failed: {error}");
                     ExitCode::FAILURE
                 }
             },
-            None => {
+            _ => {
+                eprintln!("Usage: tracefact watch-files <directory> [duration_seconds]");
+                eprintln!("Quote directory paths that contain spaces.");
+                ExitCode::FAILURE
+            }
+        },
+        Some("process") => match args.as_slice() {
+            [value] => match parse_pid(value) {
+                Ok(pid) => match run_process(pid) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("TraceFact could not observe process {pid}: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("TraceFact could not observe process: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            _ => {
                 eprintln!("Usage: tracefact process <pid>");
                 ExitCode::FAILURE
             }
         },
-        Some("inspect") => match args.next() {
-            Some(run_id) => match run_inspect(&run_id) {
+        Some("inspect") => match args.as_slice() {
+            [run_id] => match run_inspect(run_id) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("TraceFact could not inspect run {run_id}: {error}");
                     ExitCode::FAILURE
                 }
             },
-            None => {
+            _ => {
                 eprintln!("Usage: tracefact inspect <run_id|latest>");
                 ExitCode::FAILURE
             }
         },
-        Some("export") => match (args.next(), args.next()) {
-            (Some(run_id), Some(path)) => match run_export(&run_id, &path) {
+        Some("export") => match args.as_slice() {
+            [run_id, path] => match run_export(run_id.as_str(), path.as_str()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("TraceFact could not export evidence: {error}");
@@ -2074,62 +2168,56 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("baseline") => match args.next().as_deref() {
-            Some("save") => match (args.next(), args.next()) {
-                (Some(name), Some(run_id)) => match run_baseline_save(&name, &run_id) {
+        Some("baseline") => match args.as_slice() {
+            [action, name, run_id] if action == "save" => {
+                match run_baseline_save(name.as_str(), run_id.as_str()) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("TraceFact could not save baseline: {error}");
                         ExitCode::FAILURE
                     }
-                },
-                _ => {
-                    eprintln!("Usage: tracefact baseline save <name> <run_id|latest>");
-                    ExitCode::FAILURE
                 }
-            },
-            Some("list") => match run_baseline_list() {
+            }
+            [action] if action == "list" => match run_baseline_list() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("TraceFact could not list baselines: {error}");
                     ExitCode::FAILURE
                 }
             },
-            Some("inspect") => match args.next() {
-                Some(name) => match run_baseline_inspect(&name) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => {
-                        eprintln!("TraceFact could not inspect baseline: {error}");
-                        ExitCode::FAILURE
-                    }
-                },
-                None => {
-                    eprintln!("Usage: tracefact baseline inspect <name>");
+            [action, name] if action == "inspect" => match run_baseline_inspect(name.as_str()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("TraceFact could not inspect baseline: {error}");
                     ExitCode::FAILURE
                 }
             },
-            Some("export") => match (args.next(), args.next()) {
-                (Some(name), Some(path)) => match run_baseline_export(&name, &path) {
+            [action, name, path] if action == "export" => {
+                match run_baseline_export(name.as_str(), path.as_str()) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("TraceFact could not export baseline: {error}");
                         ExitCode::FAILURE
                     }
-                },
-                _ => {
-                    eprintln!("Usage: tracefact baseline export <name> <path.json>");
-                    ExitCode::FAILURE
                 }
-            },
+            }
             _ => {
                 eprintln!("Usage: tracefact baseline <save|list|inspect|export> ...");
                 ExitCode::FAILURE
             }
         },
-        Some("compare") => match (args.next(), args.next()) {
-            (Some(baseline_name), Some(run_id)) => {
-                let output_path = args.next();
-                match run_compare(&baseline_name, &run_id, output_path.as_deref()) {
+        Some("compare") => match args.as_slice() {
+            [baseline_name, run_id] => {
+                match run_compare(baseline_name.as_str(), run_id.as_str(), None) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("TraceFact could not compare behavior: {error}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            [baseline_name, run_id, path] => {
+                match run_compare(baseline_name.as_str(), run_id.as_str(), Some(path.as_str())) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("TraceFact could not compare behavior: {error}");
@@ -2142,17 +2230,76 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("history") => match run_history(20) {
+        Some("history") if args.is_empty() => match run_history(20) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("TraceFact could not read history: {error}");
                 ExitCode::FAILURE
             }
         },
-        _ => {
-            print_help();
-            ExitCode::SUCCESS
+        Some("help") | Some("--help") | Some("-h") => {
+            eprintln!("Help does not accept additional arguments.");
+            ExitCode::FAILURE
         }
+        Some("doctor") => {
+            eprintln!("Usage: tracefact doctor");
+            ExitCode::FAILURE
+        }
+        Some("demo") => {
+            eprintln!("Usage: tracefact demo");
+            ExitCode::FAILURE
+        }
+        Some("history") => {
+            eprintln!("Usage: tracefact history");
+            ExitCode::FAILURE
+        }
+        Some(unknown) => {
+            eprintln!("Unknown command: {unknown}");
+            print_help();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_input_tests {
+    use super::{parse_duration, parse_pid, run_event_id};
+
+    #[test]
+    fn pid_must_be_a_positive_u32() {
+        assert_eq!(parse_pid("42").unwrap(), 42);
+        assert!(parse_pid("0").is_err());
+        assert!(parse_pid("-1").is_err());
+        assert!(parse_pid("not-a-pid").is_err());
+        assert!(parse_pid("4294967296").is_err());
+    }
+
+    #[test]
+    fn watch_duration_must_be_positive() {
+        assert_eq!(parse_duration("15").unwrap(), 15);
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("-2").is_err());
+        assert!(parse_duration("many").is_err());
+    }
+
+    #[test]
+    fn event_ids_are_scoped_to_their_run() {
+        assert_ne!(run_event_id("snap-one", 0), run_event_id("snap-two", 0));
+        assert_eq!(run_event_id("snap-one", 4), "snap-one-event-4");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod run_identity_tests {
+    use super::new_run_identity;
+
+    #[test]
+    fn run_ids_do_not_collide_for_repeated_snapshots() {
+        let (_, first) = new_run_identity("snap", None).unwrap();
+        let (_, second) = new_run_identity("snap", None).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("snap-"));
+        assert!(second.starts_with("snap-"));
     }
 }
 
