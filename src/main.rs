@@ -1,4 +1,5 @@
 mod analysis;
+mod cli;
 mod collectors;
 mod model;
 mod storage;
@@ -26,31 +27,7 @@ use std::sync::{
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
-fn print_help() {
-    println!("TraceFact 0.1.0");
-    println!();
-    println!("Usage:");
-    println!("  tracefact doctor");
-    println!("  tracefact demo");
-    println!("  tracefact process <pid>");
-    println!("  tracefact watch <pid>");
-    println!("  tracefact watch-files <directory> [duration_seconds]");
-    println!("    Quote directory paths that contain spaces.");
-    println!("  tracefact history");
-    println!("  tracefact inspect <run_id>");
-    println!("  tracefact inspect latest");
-    println!("  tracefact export <run_id|latest> <path.json>");
-    println!("  tracefact baseline save <name> <run_id|latest>");
-    println!("  tracefact baseline list");
-    println!("  tracefact baseline inspect <name>");
-    println!("  tracefact baseline export <name> <path.json>");
-    println!("  tracefact compare <baseline_name> <run_id|latest> [report.json]");
-    println!("  tracefact help");
-    println!();
-    println!(
-        "The process command records the selected Windows process tree and its loaded modules, creates a Runtime Passport, and saves both locally."
-    );
-}
+use crate::cli::{parse_duration, parse_pid, print_help};
 
 fn run_process(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
@@ -1121,26 +1098,6 @@ fn new_run_identity(prefix: &str, owner_pid: Option<u32>) -> Result<(i64, String
 
 fn run_event_id(run_id: &str, sequence: u64) -> String {
     format!("{run_id}-event-{sequence}")
-}
-
-fn parse_pid(value: &str) -> Result<u32, String> {
-    let pid = value
-        .parse::<u32>()
-        .map_err(|_| "PID must be a positive 32-bit integer.".to_string())?;
-    if pid == 0 {
-        return Err("PID must be greater than zero.".to_string());
-    }
-    Ok(pid)
-}
-
-fn parse_duration(value: &str) -> Result<u64, String> {
-    let seconds = value
-        .parse::<u64>()
-        .map_err(|_| "Duration must be a positive number of seconds.".to_string())?;
-    if seconds == 0 {
-        return Err("Duration must be greater than zero seconds.".to_string());
-    }
-    Ok(seconds)
 }
 
 fn run_baseline_save(name: &str, run_id: &str) -> Result<(), String> {
