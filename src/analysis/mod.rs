@@ -20,9 +20,12 @@ pub struct PassportAccumulator {
 impl PassportAccumulator {
     pub fn observe(&mut self, event: &RuntimeEvent) {
         match event.event_type {
-            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved => {
+            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved
+                if event.subject != "watch_summary" =>
+            {
                 self.processes.insert(event.process.executable.clone());
             }
+            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved => {}
             EventType::NetworkConnection | EventType::DnsLookup => {
                 if let Some(target) = &event.target {
                     self.network_targets.insert(target.clone());
@@ -211,6 +214,21 @@ pub fn evidence_bundle_from_run(
         .get("network_connection")
         .copied()
         .unwrap_or(0);
+
+    if is_watch {
+        match process_watch_loss_counts(run) {
+            Some((0, 0, 0)) => {}
+            Some((dropped_starts, dropped_exits, unpersisted)) => {
+                limitations.push(format!(
+                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, and {unpersisted} queued or failed event records; process-set comparison is skipped."
+                ));
+            }
+            None => limitations.push(
+                "The process watch has no single valid queue-coverage summary; process-set comparison is skipped."
+                    .to_string(),
+            ),
+        }
+    }
 
     let scope_kind = if is_filesystem_watch {
         "selected_directory_watch"
@@ -555,12 +573,15 @@ pub fn compare_baseline_to_run(
             &baseline.passport.observations.processes,
             &current_run.passport.observations.processes,
             has_process_provenance(&baseline.coverage.collector_sources)
-                && has_process_provenance(&current_evidence.coverage.collector_sources),
+                && has_process_provenance(&current_evidence.coverage.collector_sources)
+                && (baseline_scope.kind != "selected_process_tree_watch"
+                    || (process_watch_coverage_complete(baseline_run)
+                        && process_watch_coverage_complete(current_run))),
             baseline_run,
             current_run,
         );
         if skipped_categories.iter().any(|item| item == "processes") {
-            limitations.push("Process observations were skipped because both runs do not contain process-collector event provenance.".to_string());
+            limitations.push("Process observations were skipped because one or both runs lack process-collector provenance or complete process-watch queue coverage.".to_string());
         }
 
         let network_comparable = baseline.scope.kind == "selected_process_tree_watch"
@@ -747,6 +768,27 @@ fn has_process_provenance(sources: &[String]) -> bool {
     sources
         .iter()
         .any(|source| source == "windows_process" || source == "windows_process_watch")
+}
+
+fn process_watch_loss_counts(run: &StoredRun) -> Option<(u64, u64, u64)> {
+    let mut summaries = run.events.iter().filter(|event| {
+        event.source == "windows_process_watch" && event.subject.as_deref() == Some("watch_summary")
+    });
+    let summary = summaries.next()?;
+    if summaries.next().is_some() {
+        return None;
+    }
+
+    let metadata = serde_json::from_str::<serde_json::Value>(&summary.metadata_json).ok()?;
+    Some((
+        metadata.get("dropped_start_events")?.as_u64()?,
+        metadata.get("dropped_exit_events")?.as_u64()?,
+        metadata.get("unpersisted_events_at_stop")?.as_u64()?,
+    ))
+}
+
+fn process_watch_coverage_complete(run: &StoredRun) -> bool {
+    process_watch_loss_counts(run) == Some((0, 0, 0))
 }
 
 fn compare_observation_category(
@@ -955,6 +997,18 @@ mod evidence_bundle_tests {
                     sensitivity: "SystemMetadata".to_string(),
                 },
                 StoredEvent {
+                    event_id: "process-watch-summary".to_string(),
+                    timestamp_ms: 200,
+                    event_type: "process_observed".to_string(),
+                    pid: Some(42),
+                    executable: Some("process-watch-summary".to_string()),
+                    subject: Some("watch_summary".to_string()),
+                    target: None,
+                    metadata_json: r#"{"operation":"watch_summary","root_pid":42,"dropped_start_events":0,"dropped_exit_events":0,"unpersisted_events_at_stop":0,"queue_capacity":4096}"#.to_string(),
+                    source: "windows_process_watch".to_string(),
+                    sensitivity: "SystemMetadata".to_string(),
+                },
+                StoredEvent {
                     event_id: "network-event".to_string(),
                     timestamp_ms: 120,
                     event_type: "network_connection".to_string(),
@@ -1039,7 +1093,7 @@ mod evidence_bundle_tests {
         assert_eq!(bundle.scope.kind, "selected_process_tree_watch");
         assert_eq!(bundle.scope.root_pid, Some(42));
         assert!(bundle.scope.includes_descendants);
-        assert_eq!(bundle.coverage.event_count, 2);
+        assert_eq!(bundle.coverage.event_count, 3);
         assert_eq!(
             bundle.coverage.event_counts_by_type["network_connection"],
             1
@@ -1054,7 +1108,52 @@ mod evidence_bundle_tests {
     }
 
     #[test]
-    fn incomplete_source_run_is_explicit_in_evidence_limitations() {
+    fn incomplete_source_run_is_explicit_in_evidence_limitations() {    #[test]
+    fn process_queue_loss_is_reported_and_skips_process_comparison() {
+        let mut baseline_run = sample_run("completed");
+        let summary = baseline_run
+            .events
+            .iter_mut()
+            .find(|event| event.subject.as_deref() == Some("watch_summary"))
+            .expect("sample run has a process coverage summary");
+        summary.metadata_json = r#"{"operation":"watch_summary","root_pid":42,"dropped_start_events":3,"dropped_exit_events":1,"unpersisted_events_at_stop":2,"queue_capacity":4096}"#.to_string();
+
+        let bundle = evidence_bundle_from_run(&baseline_run, 300)
+            .expect("queue loss should remain exportable");
+        assert!(bundle.coverage.limitations.iter().any(|note| {
+            note.contains("did not persist 3 start-event records, 1 exit-event records, and 2 queued or failed event records")
+        }));
+
+        let baseline = super::baseline_from_run(&baseline_run, "lossy", 300)
+            .expect("completed run should remain a recordable baseline");
+        let current_run = sample_run("completed");
+        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
+            .expect("comparison should report incomplete process coverage");
+        assert!(report.skipped_categories.contains(&"processes".to_string()));
+        assert!(!report.compared_categories.contains(&"processes".to_string()));
+    }
+
+    #[test]
+    fn legacy_process_watch_without_summary_skips_process_comparison() {
+        let mut baseline_run = sample_run("completed");
+        baseline_run
+            .events
+            .retain(|event| event.subject.as_deref() != Some("watch_summary"));
+        let bundle = evidence_bundle_from_run(&baseline_run, 300)
+            .expect("legacy run should remain exportable");
+        assert!(bundle.coverage.limitations.iter().any(|note| {
+            note.contains("no single valid queue-coverage summary")
+        }));
+
+        let baseline = super::baseline_from_run(&baseline_run, "legacy", 300)
+            .expect("legacy completed run should remain a recordable baseline");
+        let current_run = sample_run("completed");
+        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
+            .expect("comparison should report unknown historical queue coverage");
+        assert!(report.skipped_categories.contains(&"processes".to_string()));
+    }
+
+
         let run = sample_run("interrupted");
         let bundle = evidence_bundle_from_run(&run, 300).expect("bundle should be built");
         assert!(bundle
@@ -1096,7 +1195,7 @@ mod evidence_bundle_tests {
             vec!["a.exe".to_string(), "z.exe".to_string()]
         );
         assert!(baseline.passport.changes.is_empty());
-        assert_eq!(baseline.coverage.event_count, 2);
+        assert_eq!(baseline.coverage.event_count, 3);
         assert!(baseline
             .coverage
             .limitations

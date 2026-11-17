@@ -464,9 +464,10 @@ fn drain_network_queue(
 fn run_watch(pid: u32) -> Result<(), String> {
     use collectors::windows_network::WindowsNetworkEventWatcher;
     use collectors::windows_process::{
-        build_process_exit_event, build_process_lifecycle_event, classify_process_depth,
-        snapshot_process_tree, wait_for_watchers, ProcessWatchEvent, WatchSource,
-        WindowsProcessEventWatcher,
+        build_process_exit_event, build_process_lifecycle_event,
+        build_process_watch_summary_event, classify_process_depth, snapshot_process_tree,
+        wait_for_watchers, ProcessWatchControl, ProcessWatchEvent,
+        WindowsProcessEventWatcher, PROCESS_EVENT_QUEUE_CAPACITY,
     };
 
     let (started_at_ms, run_id) = new_run_identity("watch", Some(pid))?;
@@ -488,18 +489,15 @@ fn run_watch(pid: u32) -> Result<(), String> {
     let mut network_watcher =
         WindowsNetworkEventWatcher::start().map_err(|error| error.to_string())?;
     let watcher = WindowsProcessEventWatcher::start();
+    if let Err(error) = wait_for_watchers(&watcher, Duration::from_secs(10)) {
+        let stop_result = network_watcher.stop();
+        return Err(match stop_result {
+            Ok(()) => error.to_string(),
+            Err(stop_error) => format!("{error}; additionally, {stop_error}"),
+        });
+    }
     let receiver = watcher.receiver();
-
-    let queued_events = match wait_for_watchers(receiver, Duration::from_secs(10)) {
-        Ok(events) => events,
-        Err(error) => {
-            let stop_result = network_watcher.stop();
-            return Err(match stop_result {
-                Ok(()) => error.to_string(),
-                Err(stop_error) => format!("{error}; additionally, {stop_error}"),
-            });
-        }
-    };
+    let control_receiver = watcher.control_receiver();
 
     let initial_events = match snapshot_process_tree(pid, &run_id) {
         Ok(events) => events,
@@ -577,18 +575,34 @@ fn run_watch(pid: u32) -> Result<(), String> {
     println!();
     println!("Watching process starts, exits, and TCP connection metadata. Press Ctrl+C to stop.");
 
-    const MAX_QUEUED_PROCESS_EVENTS_ON_STOP: usize = 4096;
-    let mut process_events_drained_after_stop = 0_usize;
-    let mut process_events_discarded_at_stop = 0_usize;
-    let mut process_queue_drain_limited = false;
+    let mut process_event_queue_stopped = false;
+    let mut process_events_persistence_failures = 0_usize;
     let mut stop_reason: Option<&'static str> = None;
     let mut network_error = None;
 
     let watch_result = (|| -> Result<(), String> {
         let network_receiver = network_watcher.receiver();
-        let mut pending_events = queued_events.into_iter();
 
         'watch: loop {
+            loop {
+                match control_receiver.try_recv() {
+                    Ok(ProcessWatchControl::Ready(_)) => {}
+                    Ok(ProcessWatchControl::Error(message)) => {
+                        network_error = Some(message);
+                        stop_reason = Some("process observer stopped");
+                        break 'watch;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        network_error = Some(
+                            "Windows process control channel disconnected.".to_string(),
+                        );
+                        stop_reason = Some("process observer disconnected");
+                        break 'watch;
+                    }
+                }
+            }
+
             if let Some(message) = drain_network_queue(
                 network_receiver,
                 true,
@@ -611,31 +625,15 @@ fn run_watch(pid: u32) -> Result<(), String> {
                 break 'watch;
             }
 
-            let incoming = if let Some(event) = pending_events.next() {
-                Some(event)
-            } else if stop_requested.load(Ordering::SeqCst) {
-                if process_events_drained_after_stop < MAX_QUEUED_PROCESS_EVENTS_ON_STOP {
-                    match receiver.try_recv() {
-                        Ok(event) => {
-                            process_events_drained_after_stop += 1;
-                            Some(event)
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty)
-                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-                    }
-                } else {
-                    match receiver.try_recv() {
-                        Ok(_event) => {
-                            process_queue_drain_limited = true;
-                            process_events_discarded_at_stop = 1 + receiver
-                                .try_iter()
-                                .take(MAX_QUEUED_PROCESS_EVENTS_ON_STOP)
-                                .count();
-                            None
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty)
-                        | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-                    }
+            let incoming = if stop_requested.load(Ordering::SeqCst) {
+                if !process_event_queue_stopped {
+                    watcher.stop_event_collection();
+                    process_event_queue_stopped = true;
+                }
+                match receiver.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
                 }
             } else {
                 match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -683,8 +681,13 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         &event,
                         depth,
                     );
-                    storage::append_event(&mut connection, &run_id, &runtime_event)
-                        .map_err(|error| error.to_string())?;
+                    if let Err(error) =
+                        storage::append_event(&mut connection, &run_id, &runtime_event)
+                    {
+                        process_events_persistence_failures =
+                            process_events_persistence_failures.saturating_add(1);
+                        return Err(error.to_string());
+                    }
 
                     sequence = next_sequence;
                     active.insert(
@@ -731,8 +734,13 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         previous.depth,
                         relationship,
                     );
-                    storage::append_event(&mut connection, &run_id, &runtime_event)
-                        .map_err(|error| error.to_string())?;
+                    if let Err(error) =
+                        storage::append_event(&mut connection, &run_id, &runtime_event)
+                    {
+                        process_events_persistence_failures =
+                            process_events_persistence_failures.saturating_add(1);
+                        return Err(error.to_string());
+                    }
 
                     sequence = next_sequence;
                     active.remove(&event.process_id);
@@ -747,12 +755,6 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         stop_reason = Some("root process exited");
                         break 'watch;
                     }
-                }
-                ProcessWatchEvent::Ready(source) => match source {
-                    WatchSource::Starts | WatchSource::Exits => {}
-                },
-                ProcessWatchEvent::Error(message) => {
-                    return Err(message);
                 }
             }
         }
@@ -771,6 +773,12 @@ fn run_watch(pid: u32) -> Result<(), String> {
             None => network_error = Some(message),
         }
     }
+
+    let process_event_drops = watcher.stop_event_collection();
+    let process_events_not_persisted_at_stop = receiver
+        .try_iter()
+        .count()
+        .saturating_add(process_events_persistence_failures);
 
     if let Err(error) = network_watcher.stop() {
         if network_error.is_none() {
@@ -814,6 +822,26 @@ fn run_watch(pid: u32) -> Result<(), String> {
     }
 
     let stop_reason = stop_reason.unwrap_or("stopped by user");
+    let ended_at_ms = current_unix_ms()?;
+    let summary_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| "Process event sequence exhausted.".to_string())?;
+    let process_summary = build_process_watch_summary_event(
+        &run_id,
+        summary_sequence,
+        pid,
+        ended_at_ms,
+        process_event_drops,
+        process_events_not_persisted_at_stop,
+    );
+    if let Err(error) = storage::append_event(&mut connection, &run_id, &process_summary) {
+        if network_error.is_none() {
+            network_error = Some(format!("Could not save process watch summary: {error}"));
+        }
+    } else {
+        sequence = summary_sequence;
+    }
+
     let terminal_status = if network_error.is_some() {
         "failed"
     } else if stop_reason == "root process exited" {
@@ -821,7 +849,6 @@ fn run_watch(pid: u32) -> Result<(), String> {
     } else {
         "interrupted"
     };
-    let ended_at_ms = current_unix_ms()?;
     let final_passport = passport.finish(&run_id, ended_at_ms, &application);
     storage::finish_run_with_status(
         &mut connection,
@@ -839,18 +866,25 @@ fn run_watch(pid: u32) -> Result<(), String> {
     println!("  Network events saved: {network_events_saved}");
     println!("  Network events filtered: {network_events_filtered}");
     println!("  Network events with unverified attribution: {network_attribution_failures}");
-    if process_queue_drain_limited {
-        println!(
-            "  Process events not drained at stop: at least {} (shutdown drain cap {})",
-            process_events_discarded_at_stop, MAX_QUEUED_PROCESS_EVENTS_ON_STOP
-        );
-    }
     if let Some(message) = &first_attribution_error {
         println!("  First attribution error: {message}");
     }
     println!(
         "  Network queue drops:  {}",
         network_watcher.dropped_events()
+    );
+    println!("  Process queue capacity: {}", PROCESS_EVENT_QUEUE_CAPACITY);
+    println!(
+        "  Process start events dropped: {}",
+        process_event_drops.start_events
+    );
+    println!(
+        "  Process exit events dropped:  {}",
+        process_event_drops.exit_events
+    );
+    println!(
+        "  Process events not persisted: {}",
+        process_events_not_persisted_at_stop
     );
     println!("  Active at stop:       {}", active.len());
 
