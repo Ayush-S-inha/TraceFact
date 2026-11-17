@@ -905,9 +905,9 @@ mod tests {
         assert_eq!(event.metadata["unpersisted_events_at_stop"], 4);
     }
 
-
     #[test]
-    fn missing_root_is_an_error() {        let processes = vec![ProcessRecord {
+    fn missing_root_is_an_error() {
+        let processes = vec![ProcessRecord {
             pid: 10,
             parent_pid: 1,
             name: "root.exe".into(),

@@ -901,7 +901,7 @@ fn category_context_event_ids(run: &StoredRun, category: &str) -> Vec<String> {
             "processes" => {
                 event.event_type.starts_with("process_")
                     && event.subject.as_deref() != Some("watch_summary")
-            },
+            }
             "network_targets" => {
                 event.event_type == "network_connection" || event.event_type == "dns_lookup"
             }
@@ -1132,7 +1132,9 @@ mod evidence_bundle_tests {
         let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
             .expect("comparison should report incomplete process coverage");
         assert!(report.skipped_categories.contains(&"processes".to_string()));
-        assert!(!report.compared_categories.contains(&"processes".to_string()));
+        assert!(!report
+            .compared_categories
+            .contains(&"processes".to_string()));
     }
 
     #[test]
@@ -1143,9 +1145,11 @@ mod evidence_bundle_tests {
             .retain(|event| event.subject.as_deref() != Some("watch_summary"));
         let bundle = evidence_bundle_from_run(&baseline_run, 300)
             .expect("legacy run should remain exportable");
-        assert!(bundle.coverage.limitations.iter().any(|note| {
-            note.contains("no single valid queue-coverage summary")
-        }));
+        assert!(bundle
+            .coverage
+            .limitations
+            .iter()
+            .any(|note| { note.contains("no single valid queue-coverage summary") }));
 
         let baseline = super::baseline_from_run(&baseline_run, "legacy", 300)
             .expect("legacy completed run should remain a recordable baseline");
@@ -1155,9 +1159,9 @@ mod evidence_bundle_tests {
         assert!(report.skipped_categories.contains(&"processes".to_string()));
     }
 
-
     #[test]
-    fn incomplete_source_run_is_explicit_in_evidence_limitations() {        let run = sample_run("interrupted");
+    fn incomplete_source_run_is_explicit_in_evidence_limitations() {
+        let run = sample_run("interrupted");
         let bundle = evidence_bundle_from_run(&run, 300).expect("bundle should be built");
         assert!(bundle
             .coverage

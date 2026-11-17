@@ -464,10 +464,9 @@ fn drain_network_queue(
 fn run_watch(pid: u32) -> Result<(), String> {
     use collectors::windows_network::WindowsNetworkEventWatcher;
     use collectors::windows_process::{
-        build_process_exit_event, build_process_lifecycle_event,
-        build_process_watch_summary_event, classify_process_depth, snapshot_process_tree,
-        wait_for_watchers, ProcessWatchControl, ProcessWatchEvent,
-        WindowsProcessEventWatcher, PROCESS_EVENT_QUEUE_CAPACITY,
+        build_process_exit_event, build_process_lifecycle_event, build_process_watch_summary_event,
+        classify_process_depth, snapshot_process_tree, wait_for_watchers, ProcessWatchControl,
+        ProcessWatchEvent, WindowsProcessEventWatcher, PROCESS_EVENT_QUEUE_CAPACITY,
     };
 
     let (started_at_ms, run_id) = new_run_identity("watch", Some(pid))?;
@@ -594,9 +593,8 @@ fn run_watch(pid: u32) -> Result<(), String> {
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        network_error = Some(
-                            "Windows process control channel disconnected.".to_string(),
-                        );
+                        network_error =
+                            Some("Windows process control channel disconnected.".to_string());
                         stop_reason = Some("process observer disconnected");
                         break 'watch;
                     }
