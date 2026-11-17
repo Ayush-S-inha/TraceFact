@@ -215,21 +215,6 @@ pub fn evidence_bundle_from_run(
         .copied()
         .unwrap_or(0);
 
-    if is_watch {
-        match process_watch_loss_counts(run) {
-            Some((0, 0, 0)) => {}
-            Some((dropped_starts, dropped_exits, unpersisted)) => {
-                limitations.push(format!(
-                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, and {unpersisted} queued or failed event records; process-set comparison is skipped."
-                ));
-            }
-            None => limitations.push(
-                "The process watch has no single valid queue-coverage summary; process-set comparison is skipped."
-                    .to_string(),
-            ),
-        }
-    }
-
     let scope_kind = if is_filesystem_watch {
         "selected_directory_watch"
     } else if is_watch {
@@ -247,6 +232,21 @@ pub fn evidence_bundle_from_run(
 
     let mut limitations =
         vec!["An absent event is not proof that the behavior did not occur.".to_string()];
+
+    if is_watch {
+        match process_watch_loss_counts(run) {
+            Some((0, 0, 0)) => {}
+            Some((dropped_starts, dropped_exits, unpersisted)) => {
+                limitations.push(format!(
+                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, and {unpersisted} queued or failed event records; process-set comparison is skipped."
+                ));
+            }
+            None => limitations.push(
+                "The process watch has no single valid queue-coverage summary; process-set comparison is skipped."
+                    .to_string(),
+            ),
+        }
+    }
 
     if is_filesystem_watch {
         limitations.push(
@@ -898,7 +898,10 @@ fn category_context_event_ids(run: &StoredRun, category: &str) -> Vec<String> {
         .events
         .iter()
         .filter(|event| match category {
-            "processes" => event.event_type.starts_with("process_"),
+            "processes" => {
+                event.event_type.starts_with("process_")
+                    && event.subject.as_deref() != Some("watch_summary")
+            },
             "network_targets" => {
                 event.event_type == "network_connection" || event.event_type == "dns_lookup"
             }
