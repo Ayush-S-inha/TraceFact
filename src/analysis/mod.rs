@@ -1000,18 +1000,6 @@ mod evidence_bundle_tests {
                     sensitivity: "SystemMetadata".to_string(),
                 },
                 StoredEvent {
-                    event_id: "process-watch-summary".to_string(),
-                    timestamp_ms: 200,
-                    event_type: "process_observed".to_string(),
-                    pid: Some(42),
-                    executable: Some("process-watch-summary".to_string()),
-                    subject: Some("watch_summary".to_string()),
-                    target: None,
-                    metadata_json: r#"{"operation":"watch_summary","root_pid":42,"dropped_start_events":0,"dropped_exit_events":0,"unpersisted_events_at_stop":0,"queue_capacity":4096}"#.to_string(),
-                    source: "windows_process_watch".to_string(),
-                    sensitivity: "SystemMetadata".to_string(),
-                },
-                StoredEvent {
                     event_id: "network-event".to_string(),
                     timestamp_ms: 120,
                     event_type: "network_connection".to_string(),
@@ -1021,6 +1009,18 @@ mod evidence_bundle_tests {
                     target: Some("203.0.113.10:443".to_string()),
                     metadata_json: r#"{"protocol":"tcp","operation":"connect"}"#.to_string(),
                     source: "windows_network_watch".to_string(),
+                    sensitivity: "SystemMetadata".to_string(),
+                },
+                StoredEvent {
+                    event_id: "process-watch-summary".to_string(),
+                    timestamp_ms: 200,
+                    event_type: "process_observed".to_string(),
+                    pid: Some(42),
+                    executable: Some("process-watch-summary".to_string()),
+                    subject: Some("watch_summary".to_string()),
+                    target: None,
+                    metadata_json: r#"{"operation":"watch_summary","root_pid":42,"dropped_start_events":0,"dropped_exit_events":0,"unpersisted_events_at_stop":0,"queue_capacity":4096}"#.to_string(),
+                    source: "windows_process_watch".to_string(),
                     sensitivity: "SystemMetadata".to_string(),
                 },
             ],
@@ -1535,8 +1535,10 @@ mod evidence_bundle_tests {
         run.passport.observations.network_targets.clear();
         run.passport.observations.libraries =
             libraries.iter().map(|path| (*path).to_string()).collect();
-        run.events
-            .retain(|event| event.event_type == "process_observed");
+        run.events.retain(|event| {
+            event.event_type == "process_observed"
+                && event.subject.as_deref() != Some("watch_summary")
+        });
         run.events[0].source = "windows_process".to_string();
 
         for (index, path) in libraries.iter().enumerate() {
