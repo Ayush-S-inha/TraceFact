@@ -842,7 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_root_is_an_error() {    #[test]
     fn bounded_queue_counts_start_and_exit_drops_separately() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let queue_state = Mutex::new(ProcessEventQueueState::default());
@@ -907,7 +906,8 @@ mod tests {
     }
 
 
-        let processes = vec![ProcessRecord {
+    #[test]
+    fn missing_root_is_an_error() {        let processes = vec![ProcessRecord {
             pid: 10,
             parent_pid: 1,
             name: "root.exe".into(),

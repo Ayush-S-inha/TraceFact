@@ -1111,7 +1111,6 @@ mod evidence_bundle_tests {
     }
 
     #[test]
-    fn incomplete_source_run_is_explicit_in_evidence_limitations() {    #[test]
     fn process_queue_loss_is_reported_and_skips_process_comparison() {
         let mut baseline_run = sample_run("completed");
         let summary = baseline_run
@@ -1157,7 +1156,8 @@ mod evidence_bundle_tests {
     }
 
 
-        let run = sample_run("interrupted");
+    #[test]
+    fn incomplete_source_run_is_explicit_in_evidence_limitations() {        let run = sample_run("interrupted");
         let bundle = evidence_bundle_from_run(&run, 300).expect("bundle should be built");
         assert!(bundle
             .coverage
