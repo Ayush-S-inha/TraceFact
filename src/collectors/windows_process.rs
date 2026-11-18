@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ use crate::collectors::{Collector, CollectorError};
 use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
 
 const ERROR_NO_MORE_FILES: u32 = 18;
+pub const PROCESS_EVENT_QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessRecord {
@@ -101,7 +103,7 @@ impl WindowsProcessCollector {
 
             let executable = process.name.clone();
             events.push(RuntimeEvent {
-                id: format!("winproc-{timestamp_ms}-{}-{}", self.root_pid, process.pid),
+                id: process_observation_id(timestamp_ms, self.root_pid, process.pid, self.sequence),
                 timestamp_ms,
                 event_type: EventType::ProcessObserved,
                 process: ProcessIdentity {
@@ -222,7 +224,7 @@ impl WindowsProcessCollector {
 
             if let Some(child_pids) = children.get(&pid) {
                 for child_pid in child_pids {
-                    queue.push_back((*child_pid, depth + 1));
+                    queue.push_back((*child_pid, depth.saturating_add(1)));
                 }
             }
         }
@@ -242,9 +244,13 @@ impl WindowsProcessCollector {
     pub(crate) fn now_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0)
     }
+}
+
+fn process_observation_id(timestamp_ms: i64, root_pid: u32, pid: u32, sequence: u64) -> String {
+    format!("winproc-{timestamp_ms}-{root_pid}-{pid}-{sequence}")
 }
 
 impl Collector for WindowsProcessCollector {
@@ -261,6 +267,10 @@ impl Collector for WindowsProcessCollector {
 pub enum ProcessWatchEvent {
     Start(ProcessStartTrace),
     Exit(ProcessStopTrace),
+}
+
+#[derive(Debug)]
+pub enum ProcessWatchControl {
     Ready(WatchSource),
     Error(String),
 }
@@ -269,6 +279,18 @@ pub enum ProcessWatchEvent {
 pub enum WatchSource {
     Starts,
     Exits,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessEventDropCounts {
+    pub start_events: usize,
+    pub exit_events: usize,
+}
+
+#[derive(Default)]
+struct ProcessEventQueueState {
+    stopped: bool,
+    dropped: ProcessEventDropCounts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -292,113 +314,201 @@ pub struct ProcessStopTrace {
 
 pub struct WindowsProcessEventWatcher {
     receiver: Receiver<ProcessWatchEvent>,
+    control_receiver: Receiver<ProcessWatchControl>,
+    queue_state: Arc<Mutex<ProcessEventQueueState>>,
 }
 
 impl WindowsProcessEventWatcher {
     pub fn start() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        spawn_start_watcher(sender.clone());
-        spawn_exit_watcher(sender);
-        Self { receiver }
+        let (sender, receiver) = mpsc::sync_channel(PROCESS_EVENT_QUEUE_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel();
+        let queue_state = Arc::new(Mutex::new(ProcessEventQueueState::default()));
+        spawn_start_watcher(
+            sender.clone(),
+            control_sender.clone(),
+            Arc::clone(&queue_state),
+        );
+        spawn_exit_watcher(sender, control_sender, Arc::clone(&queue_state));
+        Self {
+            receiver,
+            control_receiver,
+            queue_state,
+        }
     }
 
     pub fn receiver(&self) -> &Receiver<ProcessWatchEvent> {
         &self.receiver
     }
+
+    pub fn control_receiver(&self) -> &Receiver<ProcessWatchControl> {
+        &self.control_receiver
+    }
+
+    pub fn stop_event_collection(&self) -> ProcessEventDropCounts {
+        let mut state = self
+            .queue_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopped = true;
+        state.dropped
+    }
 }
 
-fn spawn_start_watcher(sender: Sender<ProcessWatchEvent>) {
-    thread::spawn(move || {
-        let connection = match WMIConnection::new() {
-            Ok(connection) => connection,
-            Err(error) => {
-                let _ = sender.send(ProcessWatchEvent::Error(format!(
-                    "Could not connect to WMI for process start events: {error}"
-                )));
-                return;
-            }
-        };
+fn try_send_process_event(
+    sender: &SyncSender<ProcessWatchEvent>,
+    queue_state: &Mutex<ProcessEventQueueState>,
+    event: ProcessWatchEvent,
+) -> bool {
+    let mut state = queue_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.stopped {
+        return false;
+    }
 
-        let events = match connection.notification::<ProcessStartTrace>() {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = sender.send(ProcessWatchEvent::Error(format!(
-                    "Could not subscribe to Windows process start events: {error}"
-                )));
-                return;
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(event)) => {
+            match event {
+                ProcessWatchEvent::Start(_) => {
+                    state.dropped.start_events = state.dropped.start_events.saturating_add(1);
+                }
+                ProcessWatchEvent::Exit(_) => {
+                    state.dropped.exit_events = state.dropped.exit_events.saturating_add(1);
+                }
             }
-        };
-
-        if sender
-            .send(ProcessWatchEvent::Ready(WatchSource::Starts))
-            .is_err()
-        {
-            return;
+            true
         }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
 
-        for result in events {
-            match result {
-                Ok(event) => {
-                    if sender.send(ProcessWatchEvent::Start(event)).is_err() {
+fn spawn_start_watcher(
+    sender: SyncSender<ProcessWatchEvent>,
+    control_sender: mpsc::Sender<ProcessWatchControl>,
+    queue_state: Arc<Mutex<ProcessEventQueueState>>,
+) {
+    let thread_control_sender = control_sender.clone();
+    let result = thread::Builder::new()
+        .name("tracefact-process-starts".to_string())
+        .spawn(move || {
+            let connection = match WMIConnection::new() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                        "Could not connect to WMI for process start events: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            let events = match connection.notification::<ProcessStartTrace>() {
+                Ok(events) => events,
+                Err(error) => {
+                    let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                        "Could not subscribe to Windows process start events: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            if thread_control_sender
+                .send(ProcessWatchControl::Ready(WatchSource::Starts))
+                .is_err()
+            {
+                return;
+            }
+
+            for result in events {
+                match result {
+                    Ok(event) => {
+                        if !try_send_process_event(
+                            &sender,
+                            &queue_state,
+                            ProcessWatchEvent::Start(event),
+                        ) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                            "Windows process start event stream failed: {error}"
+                        )));
                         break;
                     }
                 }
-                Err(error) => {
-                    let _ = sender.send(ProcessWatchEvent::Error(format!(
-                        "Windows process start event stream failed: {error}"
-                    )));
-                    break;
-                }
             }
-        }
-    });
+        });
+
+    if let Err(error) = result {
+        let _ = control_sender.send(ProcessWatchControl::Error(format!(
+            "Could not start the process start watcher thread: {error}"
+        )));
+    }
 }
 
-fn spawn_exit_watcher(sender: Sender<ProcessWatchEvent>) {
-    thread::spawn(move || {
-        let connection = match WMIConnection::new() {
-            Ok(connection) => connection,
-            Err(error) => {
-                let _ = sender.send(ProcessWatchEvent::Error(format!(
-                    "Could not connect to WMI for process exit events: {error}"
-                )));
+fn spawn_exit_watcher(
+    sender: SyncSender<ProcessWatchEvent>,
+    control_sender: mpsc::Sender<ProcessWatchControl>,
+    queue_state: Arc<Mutex<ProcessEventQueueState>>,
+) {
+    let thread_control_sender = control_sender.clone();
+    let result = thread::Builder::new()
+        .name("tracefact-process-exits".to_string())
+        .spawn(move || {
+            let connection = match WMIConnection::new() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                        "Could not connect to WMI for process exit events: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            let events = match connection.notification::<ProcessStopTrace>() {
+                Ok(events) => events,
+                Err(error) => {
+                    let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                        "Could not subscribe to Windows process exit events: {error}"
+                    )));
+                    return;
+                }
+            };
+
+            if thread_control_sender
+                .send(ProcessWatchControl::Ready(WatchSource::Exits))
+                .is_err()
+            {
                 return;
             }
-        };
 
-        let events = match connection.notification::<ProcessStopTrace>() {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = sender.send(ProcessWatchEvent::Error(format!(
-                    "Could not subscribe to Windows process exit events: {error}"
-                )));
-                return;
-            }
-        };
-
-        if sender
-            .send(ProcessWatchEvent::Ready(WatchSource::Exits))
-            .is_err()
-        {
-            return;
-        }
-
-        for result in events {
-            match result {
-                Ok(event) => {
-                    if sender.send(ProcessWatchEvent::Exit(event)).is_err() {
+            for result in events {
+                match result {
+                    Ok(event) => {
+                        if !try_send_process_event(
+                            &sender,
+                            &queue_state,
+                            ProcessWatchEvent::Exit(event),
+                        ) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = thread_control_sender.send(ProcessWatchControl::Error(format!(
+                            "Windows process exit event stream failed: {error}"
+                        )));
                         break;
                     }
                 }
-                Err(error) => {
-                    let _ = sender.send(ProcessWatchEvent::Error(format!(
-                        "Windows process exit event stream failed: {error}"
-                    )));
-                    break;
-                }
             }
-        }
-    });
+        });
+
+    if let Err(error) = result {
+        let _ = control_sender.send(ProcessWatchControl::Error(format!(
+            "Could not start the process exit watcher thread: {error}"
+        )));
+    }
 }
 
 fn process_event_metadata(
@@ -436,6 +546,39 @@ pub fn build_process_lifecycle_event(
         subject: "process".to_string(),
         target: Some(start.process_name.clone()),
         metadata: process_event_metadata(root_pid, start.parent_process_id, depth, "child"),
+        source: "windows_process_watch".to_string(),
+        sensitivity: Sensitivity::SystemMetadata,
+    }
+}
+
+pub fn build_process_watch_summary_event(
+    run_id: &str,
+    sequence: u64,
+    root_pid: u32,
+    timestamp_ms: i64,
+    dropped: ProcessEventDropCounts,
+    unpersisted_events_at_stop: usize,
+) -> RuntimeEvent {
+    RuntimeEvent {
+        id: format!("{run_id}-event-{sequence}"),
+        timestamp_ms,
+        event_type: EventType::ProcessObserved,
+        process: ProcessIdentity {
+            pid: root_pid,
+            executable: "process-watch-summary".to_string(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "watch_summary".to_string(),
+        target: None,
+        metadata: serde_json::json!({
+            "operation": "watch_summary",
+            "root_pid": root_pid,
+            "dropped_start_events": dropped.start_events,
+            "dropped_exit_events": dropped.exit_events,
+            "unpersisted_events_at_stop": unpersisted_events_at_stop,
+            "queue_capacity": PROCESS_EVENT_QUEUE_CAPACITY
+        }),
         source: "windows_process_watch".to_string(),
         sensitivity: Sensitivity::SystemMetadata,
     }
@@ -571,12 +714,11 @@ pub fn snapshot_process_tree(
 }
 
 pub fn wait_for_watchers(
-    receiver: &Receiver<ProcessWatchEvent>,
+    watcher: &WindowsProcessEventWatcher,
     timeout: Duration,
-) -> Result<Vec<ProcessWatchEvent>, CollectorError> {
+) -> Result<(), CollectorError> {
     let deadline = std::time::Instant::now() + timeout;
     let mut ready = BTreeSet::new();
-    let mut queued_events = Vec::new();
 
     while ready.len() < 2 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -587,29 +729,29 @@ pub fn wait_for_watchers(
             ));
         }
 
-        match receiver.recv_timeout(remaining) {
-            Ok(ProcessWatchEvent::Ready(source)) => {
+        match watcher.control_receiver().recv_timeout(remaining) {
+            Ok(ProcessWatchControl::Ready(source)) => {
                 ready.insert(source);
             }
-            Ok(ProcessWatchEvent::Start(event)) => {
-                queued_events.push(ProcessWatchEvent::Start(event));
-            }
-            Ok(ProcessWatchEvent::Exit(event)) => {
-                queued_events.push(ProcessWatchEvent::Exit(event));
-            }
-            Ok(ProcessWatchEvent::Error(message)) => {
+            Ok(ProcessWatchControl::Error(message)) => {
                 return Err(CollectorError::new("windows_process_watch", message));
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(CollectorError::new(
                     "windows_process_watch",
                     "Timed out waiting for Windows process event watchers to initialize.",
                 ));
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CollectorError::new(
+                    "windows_process_watch",
+                    "Process watcher control channel disconnected during startup.",
+                ));
+            }
         }
     }
 
-    Ok(queued_events)
+    Ok(())
 }
 
 fn windows_error(collector: &'static str, message: &str) -> CollectorError {
@@ -628,6 +770,29 @@ fn utf16_string(value: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_observation_ids_do_not_collide_within_the_same_millisecond() {
+        let first = process_observation_id(100, 10, 11, 1);
+        let second = process_observation_id(100, 10, 11, 2);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn watcher_startup_reports_a_disconnected_control_channel() {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let (control_sender, control_receiver) = mpsc::channel();
+        drop(control_sender);
+        let watcher = WindowsProcessEventWatcher {
+            receiver,
+            control_receiver,
+            queue_state: Arc::new(Mutex::new(ProcessEventQueueState::default())),
+        };
+
+        let error = wait_for_watchers(&watcher, Duration::from_millis(1))
+            .expect_err("a disconnected control channel is not a timeout");
+        assert!(error.message.contains("disconnected"));
+    }
 
     #[test]
     fn utf16_string_stops_at_null() {
@@ -719,6 +884,86 @@ mod tests {
 
         assert_ne!(first.id, second.id);
         assert!(matches!(first.event_type, EventType::ProcessStart));
+    }
+
+    #[test]
+    fn bounded_queue_counts_start_and_exit_drops_separately() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let queue_state = Mutex::new(ProcessEventQueueState::default());
+        let start = ProcessWatchEvent::Start(ProcessStartTrace {
+            process_id: 8101,
+            parent_process_id: 8100,
+            process_name: "worker.exe".to_string(),
+        });
+        let exit = ProcessWatchEvent::Exit(ProcessStopTrace {
+            process_id: 8102,
+            parent_process_id: 8100,
+            process_name: "child.exe".to_string(),
+            exit_status: 0,
+        });
+
+        assert!(try_send_process_event(&sender, &queue_state, start));
+        assert!(try_send_process_event(&sender, &queue_state, exit));
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        let exit = ProcessWatchEvent::Exit(ProcessStopTrace {
+            process_id: 8104,
+            parent_process_id: 8100,
+            process_name: "other.exe".to_string(),
+            exit_status: 0,
+        });
+        let start = ProcessWatchEvent::Start(ProcessStartTrace {
+            process_id: 8105,
+            parent_process_id: 8100,
+            process_name: "another.exe".to_string(),
+        });
+
+        assert!(try_send_process_event(&sender, &queue_state, exit));
+        assert!(try_send_process_event(&sender, &queue_state, start));
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        let state = queue_state.lock().unwrap();
+        assert_eq!(state.dropped.start_events, 1);
+        assert_eq!(state.dropped.exit_events, 1);
+    }
+
+    #[test]
+    fn stopped_queue_rejects_late_events() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let queue_state = Mutex::new(ProcessEventQueueState::default());
+        queue_state.lock().unwrap().stopped = true;
+        let event = ProcessWatchEvent::Start(ProcessStartTrace {
+            process_id: 8103,
+            parent_process_id: 8100,
+            process_name: "late.exe".to_string(),
+        });
+
+        assert!(!try_send_process_event(&sender, &queue_state, event));
+        assert_eq!(receiver.try_iter().count(), 0);
+        assert_eq!(
+            queue_state.lock().unwrap().dropped,
+            ProcessEventDropCounts::default()
+        );
+    }
+
+    #[test]
+    fn watch_summary_records_queue_loss() {
+        let event = build_process_watch_summary_event(
+            "watch-8100-run",
+            7,
+            8100,
+            900,
+            ProcessEventDropCounts {
+                start_events: 3,
+                exit_events: 2,
+            },
+            4,
+        );
+
+        assert_eq!(event.subject, "watch_summary");
+        assert_eq!(event.metadata["dropped_start_events"], 3);
+        assert_eq!(event.metadata["dropped_exit_events"], 2);
+        assert_eq!(event.metadata["unpersisted_events_at_stop"], 4);
     }
 
     #[test]

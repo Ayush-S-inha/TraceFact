@@ -12,6 +12,8 @@ use crate::collectors::CollectorError;
 use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
 
 const ERROR_NO_MORE_FILES: u32 = 18;
+const ERROR_BAD_LENGTH: u32 = 24;
+const SNAPSHOT_ATTEMPTS: usize = 3;
 const MAX_PROCESSES: usize = 2_048;
 const MAX_MODULES_PER_PROCESS: usize = 4_096;
 const MAX_MODULES_TOTAL: usize = 50_000;
@@ -23,12 +25,21 @@ struct SnapshotHandle(HANDLE);
 
 impl SnapshotHandle {
     fn for_process(pid: u32) -> Result<Self, u32> {
-        let handle =
-            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(unsafe { GetLastError() });
+        for attempt in 0..SNAPSHOT_ATTEMPTS {
+            let handle =
+                unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                return Ok(Self(handle));
+            }
+
+            let error = unsafe { GetLastError() };
+            if error != ERROR_BAD_LENGTH || attempt + 1 == SNAPSHOT_ATTEMPTS {
+                return Err(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(Self(handle))
+
+        Err(ERROR_BAD_LENGTH)
     }
 }
 
@@ -98,12 +109,8 @@ fn enumerate_modules(pid: u32) -> Result<(Vec<ModuleRecord>, bool), u32> {
     }
 }
 
-/// Captures a bounded, point-in-time loaded-module inventory for the processes
-/// already selected by the Windows process-tree collector.
-///
-/// Failures are recorded in one summary event instead of aborting the entire
-/// process snapshot. This matters because protected processes may deny access,
-/// and a process may exit while its module list is being read.
+/// Collects module paths for the selected process tree. Each process is
+/// snapshotted separately, so the tree-wide result is not atomic.
 pub fn collect_for_processes(
     process_events: &[RuntimeEvent],
     root_pid: u32,
@@ -124,7 +131,12 @@ pub fn collect_for_processes(
         .iter()
         .find(|event| event.process.pid == root_pid)
         .copied()
-        .unwrap_or(selected[0]);
+        .ok_or_else(|| {
+            CollectorError::new(
+                "windows_module_snapshot",
+                format!("The selected process tree does not contain root PID {root_pid}."),
+            )
+        })?;
     let timestamp_ms = now_ms();
     let snapshot_sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let capture_id = format!("{timestamp_ms}-{snapshot_sequence}");
@@ -137,7 +149,8 @@ pub fn collect_for_processes(
     let mut truncated = false;
     let mut failure_details = Vec::new();
 
-    for process_event in selected.iter().take(MAX_PROCESSES) {
+    let process_count = selected.len().min(MAX_PROCESSES);
+    for (process_index, process_event) in selected.iter().take(process_count).enumerate() {
         if observed_modules >= MAX_MODULES_TOTAL {
             truncated = true;
             break;
@@ -150,7 +163,8 @@ pub fn collect_for_processes(
                 completed_processes += 1;
                 truncated |= process_truncated;
                 let remaining = MAX_MODULES_TOTAL.saturating_sub(observed_modules);
-                if modules.len() > remaining {
+                let module_count = modules.len();
+                if module_count > remaining {
                     truncated = true;
                 }
 
@@ -167,7 +181,7 @@ pub fn collect_for_processes(
 
                     observed_modules += 1;
                     output.push(RuntimeEvent {
-                        id: format!("winmod-{capture_id}-{pid}-{index}"),
+                        id: format!("winmod-{capture_id}-{process_index}-{pid}-{index}"),
                         timestamp_ms,
                         event_type: EventType::LibraryLoaded,
                         process: ProcessIdentity {
@@ -184,7 +198,7 @@ pub fn collect_for_processes(
                             "root_pid": root_pid,
                             "process_depth": process_event.metadata.get("depth").and_then(serde_json::Value::as_u64),
                             "observation_method": "windows_toolhelp_module_snapshot",
-                            "observation_scope": "point_in_time_process_tree_snapshot"
+                            "observation_scope": "sequential_per_process_snapshot"
                         }),
                         source: "windows_module_snapshot".to_string(),
                         sensitivity: Sensitivity::PotentiallySensitive,
@@ -192,7 +206,12 @@ pub fn collect_for_processes(
                 }
 
                 if observed_modules >= MAX_MODULES_TOTAL {
-                    truncated = true;
+                    if module_count > remaining
+                        || process_truncated
+                        || process_index + 1 < process_count
+                    {
+                        truncated = true;
+                    }
                     break;
                 }
             }
@@ -209,11 +228,12 @@ pub fn collect_for_processes(
     }
 
     let process_limit_reached = selected.len() > MAX_PROCESSES;
+    let processes_skipped = selected.len().saturating_sub(attempted_processes);
     truncated |= process_limit_reached;
     let complete = failed_processes == 0
         && !truncated
         && modules_without_paths == 0
-        && completed_processes == selected.len();
+        && attempted_processes == selected.len();
 
     output.push(RuntimeEvent {
         id: format!("winmod-summary-{capture_id}-{root_pid}"),
@@ -231,6 +251,12 @@ pub fn collect_for_processes(
             "root_pid": root_pid,
             "discovered_processes": selected.len(),
             "attempted_processes": attempted_processes,
+            "processes_skipped": processes_skipped,
+            "processes_skipped_by_process_limit": selected.len().saturating_sub(process_count),
+            "processes_not_attempted_after_module_limit": process_count.saturating_sub(attempted_processes),
+            "maximum_processes": MAX_PROCESSES,
+            "maximum_modules_per_process": MAX_MODULES_PER_PROCESS,
+            "maximum_modules_total": MAX_MODULES_TOTAL,
             "completed_processes": completed_processes,
             "failed_processes": failed_processes,
             "observed_modules": observed_modules,
@@ -248,9 +274,57 @@ pub fn collect_for_processes(
     Ok(output)
 }
 
+fn timestamp_ms(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(timestamp_ms)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_for_processes, timestamp_ms, utf16_string};
+    use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
+    use std::time::Duration;
+
+    #[test]
+    fn module_name_stops_at_the_utf16_terminator() {
+        assert_eq!(
+            utf16_string(&[b'a' as u16, b'b' as u16, 0, b'c' as u16]),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn timestamp_conversion_saturates_instead_of_wrapping() {
+        assert_eq!(timestamp_ms(Duration::from_secs(u64::MAX)), i64::MAX);
+    }
+
+    #[test]
+    fn collection_rejects_a_process_list_without_the_requested_root() {
+        let event = RuntimeEvent {
+            id: "process-7".to_string(),
+            timestamp_ms: 1,
+            event_type: EventType::ProcessObserved,
+            process: ProcessIdentity {
+                pid: 7,
+                executable: "example.exe".to_string(),
+                command_line: None,
+                parent_pid: None,
+            },
+            subject: "process".to_string(),
+            target: Some("example.exe".to_string()),
+            metadata: serde_json::json!({"depth": 0}),
+            source: "windows_process".to_string(),
+            sensitivity: Sensitivity::SystemMetadata,
+        };
+
+        let error = collect_for_processes(&[event], 99)
+            .expect_err("a missing root must not fall back to an unrelated process");
+        assert!(error.to_string().contains("root PID 99"));
+    }
 }

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,11 @@ impl WindowsFileSystemEventWatcher {
                 Ok(event) => match callback_sender.try_send(FileSystemWatchMessage::Event(event)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
-                        callback_dropped.fetch_add(1, Ordering::Relaxed);
+                        let _ = callback_dropped.try_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |count| Some(count.saturating_add(1)),
+                        );
                     }
                     Err(TrySendError::Disconnected(_)) => {}
                 },
@@ -133,8 +137,85 @@ impl Drop for WindowsFileSystemEventWatcher {
 /// Collect a bounded initial directory inventory without following symlinks.
 /// File contents are never opened or read.
 pub fn initial_inventory(root: &Path) -> InitialInventory {
+    initial_inventory_with_limit(root, MAX_INITIAL_INVENTORY_ENTRIES)
+}
+
+fn initial_inventory_with_limit(root: &Path, limit: usize) -> InitialInventory {
     let mut inventory = InitialInventory::default();
-    walk_directory(root, root, &mut inventory);
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
+                continue;
+            }
+        };
+
+        let remaining = limit.saturating_sub(inventory.entries.len());
+        let mut children = Vec::new();
+        let mut too_many_entries = false;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
+                    continue;
+                }
+            };
+            if children.len() == remaining {
+                too_many_entries = true;
+                break;
+            }
+            children.push(entry);
+        }
+
+        children.sort_by_key(|entry| entry.file_name());
+        let mut child_directories = Vec::new();
+        for entry in children {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
+                    continue;
+                }
+            };
+
+            let entry_kind = if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+
+            if let Some(relative_path) = relative_path(root, &path) {
+                inventory.entries.push(InventoryEntry {
+                    relative_path,
+                    entry_kind,
+                });
+            }
+
+            // A symlink is recorded but never followed.
+            if file_type.is_dir() {
+                child_directories.push(path);
+            }
+        }
+
+        if too_many_entries {
+            inventory.truncated = true;
+            break;
+        }
+
+        // An explicit stack avoids recursive calls on deeply nested directory trees.
+        pending.extend(child_directories.into_iter().rev());
+    }
+
     inventory
         .entries
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -144,68 +225,6 @@ pub fn initial_inventory(root: &Path) -> InitialInventory {
     inventory
 }
 
-fn walk_directory(root: &Path, directory: &Path, inventory: &mut InitialInventory) {
-    if inventory.truncated {
-        return;
-    }
-
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => {
-            inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
-            return;
-        }
-    };
-
-    for entry in entries {
-        if inventory.entries.len() >= MAX_INITIAL_INVENTORY_ENTRIES {
-            inventory.truncated = true;
-            return;
-        }
-
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
-                continue;
-            }
-        };
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => {
-                inventory.unreadable_entries = inventory.unreadable_entries.saturating_add(1);
-                continue;
-            }
-        };
-
-        let entry_kind = if file_type.is_dir() {
-            "directory"
-        } else if file_type.is_file() {
-            "file"
-        } else if file_type.is_symlink() {
-            "symlink"
-        } else {
-            "other"
-        };
-
-        if let Some(relative_path) = relative_path(root, &path) {
-            inventory.entries.push(InventoryEntry {
-                relative_path,
-                entry_kind,
-            });
-        }
-
-        // Never follow symlinks. This keeps the watcher inventory within the selected root.
-        if file_type.is_dir() {
-            walk_directory(root, &path, inventory);
-            if inventory.truncated {
-                return;
-            }
-        }
-    }
-}
-
 /// Convert notify events to path-level observations. Access/read notifications are deliberately
 /// ignored: this feature records directory changes, not file reads or process-level file access.
 pub fn observations_from_event(event: &Event, root: &Path) -> Vec<FileSystemObservation> {
@@ -213,12 +232,9 @@ pub fn observations_from_event(event: &Event, root: &Path) -> Vec<FileSystemObse
         EventKind::Create(_) => path_observations("created", &event.paths, root),
         EventKind::Remove(_) => path_observations("removed", &event.paths, root),
         EventKind::Modify(ModifyKind::Name(mode)) => {
-            if event.paths.len() >= 2 {
+            if matches!(mode, RenameMode::Both) && event.paths.len() == 2 {
                 let old_path = relative_path(root, &event.paths[0]);
-                let new_path = event
-                    .paths
-                    .last()
-                    .and_then(|path| relative_path(root, path));
+                let new_path = relative_path(root, &event.paths[1]);
                 match (old_path, new_path) {
                     (Some(old_path), Some(new_path)) => vec![
                         make_observation(
@@ -289,17 +305,22 @@ fn classify_entry_kind(root: &Path, relative_path: &str) -> &'static str {
 
 fn relative_path(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    let value = relative.to_string_lossy().replace('\\', "/");
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return None;
     }
+
+    let value = relative.to_string_lossy().replace('\\', "/");
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{initial_inventory, observations_from_event, MAX_INITIAL_INVENTORY_ENTRIES};
+    use super::{
+        initial_inventory, initial_inventory_with_limit, observations_from_event, relative_path,
+    };
     use notify::event::{CreateKind, ModifyKind, RenameMode};
     use notify::{Event, EventKind};
     use std::fs;
@@ -424,7 +445,56 @@ mod tests {
     }
 
     #[test]
-    fn initial_inventory_is_bounded() {
-        assert!(MAX_INITIAL_INVENTORY_ENTRIES > 0);
+    fn initial_inventory_stops_at_the_requested_limit() {
+        let root = temp_directory();
+        fs::create_dir_all(&root).expect("create root");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(name), b"unused").expect("create file");
+        }
+
+        let inventory = initial_inventory_with_limit(&root, 2);
+        assert_eq!(inventory.entries.len(), 2);
+        assert!(inventory.truncated);
+
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn inventory_at_the_limit_is_complete_when_there_are_no_more_entries() {
+        let root = temp_directory();
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("a.txt"), b"unused").expect("create file");
+        fs::write(root.join("b.txt"), b"unused").expect("create file");
+
+        let inventory = initial_inventory_with_limit(&root, 2);
+        assert_eq!(inventory.entries.len(), 2);
+        assert!(!inventory.truncated);
+
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn rename_with_multiple_unclassified_paths_is_not_treated_as_a_pair() {
+        let root = temp_directory();
+        fs::create_dir_all(&root).expect("create root");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+            .add_path(root.join("one.txt"))
+            .add_path(root.join("two.txt"));
+
+        let observations = observations_from_event(&event, &root);
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().all(|item| item.operation == "renamed"));
+        assert!(observations.iter().all(|item| item.related_path.is_none()));
+
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn relative_path_rejects_parent_components() {
+        let root = temp_directory();
+        assert_eq!(
+            relative_path(&root, &root.join("..").join("outside.txt")),
+            None
+        );
     }
 }

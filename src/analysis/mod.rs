@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
     BehaviorDriftReport, CoverageChange, DriftFinding, EventType, EvidenceBundle, EvidenceCoverage,
@@ -20,9 +20,12 @@ pub struct PassportAccumulator {
 impl PassportAccumulator {
     pub fn observe(&mut self, event: &RuntimeEvent) {
         match event.event_type {
-            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved => {
+            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved
+                if event.subject != "watch_summary" =>
+            {
                 self.processes.insert(event.process.executable.clone());
             }
+            EventType::ProcessStart | EventType::ProcessExit | EventType::ProcessObserved => {}
             EventType::NetworkConnection | EventType::DnsLookup => {
                 if let Some(target) = &event.target {
                     self.network_targets.insert(target.clone());
@@ -140,18 +143,21 @@ pub fn evidence_bundle_from_run(
     run: &StoredRun,
     exported_at_ms: i64,
 ) -> Result<EvidenceBundle, String> {
-    use std::collections::BTreeMap;
-
     let mut event_counts_by_type = BTreeMap::<String, u64>::new();
     let mut collector_sources = BTreeSet::<String>::new();
     let mut events = Vec::with_capacity(run.events.len());
-    let mut root_pid = None;
+    let mut root_pids = BTreeSet::new();
+    let mut module_summary_count = 0usize;
+    let mut module_inventory_complete = false;
 
     for event in &run.events {
         collector_sources.insert(event.source.clone());
-        *event_counts_by_type
+        let count = event_counts_by_type
             .entry(event.event_type.clone())
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| "An event-type count exceeds the evidence format limit.".to_string())?;
 
         let metadata: serde_json::Value =
             serde_json::from_str(&event.metadata_json).map_err(|error| {
@@ -167,18 +173,30 @@ pub fn evidence_bundle_from_run(
             ));
         }
 
-        if root_pid.is_none() {
-            root_pid = metadata
-                .get("root_pid")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok());
+        if event.source == "windows_module_snapshot"
+            && event.event_type == "library_inventory_status"
+            && event.subject.as_deref() == Some("inventory_summary")
+        {
+            module_summary_count += 1;
+            module_inventory_complete = metadata
+                .get("complete")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
         }
 
-        if root_pid.is_none()
-            && event.event_type.starts_with("process_")
+        if let Some(pid) = metadata
+            .get("root_pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|pid| *pid > 0)
+        {
+            root_pids.insert(pid);
+        } else if event.event_type.starts_with("process_")
             && metadata.get("depth").and_then(serde_json::Value::as_u64) == Some(0)
         {
-            root_pid = event.pid;
+            if let Some(pid) = event.pid.filter(|pid| *pid > 0) {
+                root_pids.insert(pid);
+            }
         }
 
         events.push(EvidenceEvent {
@@ -194,6 +212,15 @@ pub fn evidence_bundle_from_run(
             sensitivity: event.sensitivity.clone(),
         });
     }
+
+    let root_pid = if root_pids.len() == 1 {
+        root_pids.iter().next().copied()
+    } else {
+        None
+    };
+    let event_count = u64::try_from(events.len()).map_err(|_| {
+        "The run contains more events than the evidence format can represent.".to_string()
+    })?;
 
     let has_windows_provenance = collector_sources
         .iter()
@@ -229,6 +256,26 @@ pub fn evidence_bundle_from_run(
 
     let mut limitations =
         vec!["An absent event is not proof that the behavior did not occur.".to_string()];
+    if root_pids.len() > 1 {
+        limitations.push(
+            "Stored events identify multiple root process IDs; the evidence bundle leaves the root PID unspecified.".to_string(),
+        );
+    }
+
+    if is_watch {
+        match process_watch_loss_counts(run) {
+            Some((0, 0, 0)) => {}
+            Some((dropped_starts, dropped_exits, unpersisted)) => {
+                limitations.push(format!(
+                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, and {unpersisted} queued or failed event records; process-set comparison is skipped."
+                ));
+            }
+            None => limitations.push(
+                "The process watch has no single valid queue-coverage summary; process-set comparison is skipped."
+                    .to_string(),
+            ),
+        }
+    }
 
     if is_filesystem_watch {
         limitations.push(
@@ -237,50 +284,49 @@ pub fn evidence_bundle_from_run(
         limitations.push(
             "Filesystem notifications may be coalesced or lost under load. Inspect the watch summary and queue-drop count before interpreting the run.".to_string(),
         );
-        for event in &run.events {
+        for event in &events {
             if event.source != "windows_filesystem_watch" || event.event_type != "file_change" {
                 continue;
             }
-            if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&event.metadata_json) {
+            let metadata = &event.metadata;
+            if metadata
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                == Some("watch_summary")
+            {
                 if metadata
-                    .get("operation")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("watch_summary")
+                    .get("initial_inventory_truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
                 {
-                    if metadata
-                        .get("initial_inventory_truncated")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    {
-                        let maximum = metadata
-                            .get("maximum_initial_inventory_entries")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(MAX_INITIAL_FILES_EVIDENCE_NOTE);
-                        limitations.push(format!("The initial filesystem inventory was capped at {maximum} entries; the directory baseline is incomplete."));
-                    }
-                    if metadata
-                        .get("initial_inventory_unreadable")
+                    let maximum = metadata
+                        .get("maximum_initial_inventory_entries")
                         .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0)
-                        > 0
-                    {
-                        limitations.push("Some filesystem entries could not be read during the initial inventory because of enumeration or permission errors.".to_string());
-                    }
-                    if metadata
-                        .get("notification_queue_dropped")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0)
-                        > 0
-                    {
-                        limitations.push("The bounded filesystem notification queue dropped events; change observations are incomplete.".to_string());
-                    }
-                    if metadata
-                        .get("filesystem_coverage_requires_review")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    {
-                        limitations.push("A directory create/rename or an unclassified/rescan notification may have changed the tree without a complete path list; filesystem-path comparison is skipped for this run.".to_string());
-                    }
+                        .unwrap_or(MAX_INITIAL_FILES_EVIDENCE_NOTE);
+                    limitations.push(format!("The initial filesystem inventory was capped at {maximum} entries; the directory baseline is incomplete."));
+                }
+                if metadata
+                    .get("initial_inventory_unreadable")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                {
+                    limitations.push("Some filesystem entries could not be read during the initial inventory because of enumeration or permission errors.".to_string());
+                }
+                if metadata
+                    .get("notification_queue_dropped")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                {
+                    limitations.push("The bounded filesystem notification queue dropped events; change observations are incomplete.".to_string());
+                }
+                if metadata
+                    .get("filesystem_coverage_requires_review")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    limitations.push("A directory create/rename or an unclassified/rescan notification may have changed the tree without a complete path list; filesystem-path comparison is skipped for this run.".to_string());
                 }
             }
         }
@@ -292,7 +338,7 @@ pub fn evidence_bundle_from_run(
         limitations.push(
             "Loaded modules are captured by a point-in-time Windows Toolhelp snapshot. Transient loads are not captured, inaccessible or exited processes and modules without resolved paths can be omitted from reliable comparison, and this inventory does not verify file hashes, signatures, versions, or trust.".to_string(),
         );
-        if !library_inventory_complete(run) {
+        if module_summary_count != 1 || !module_inventory_complete {
             limitations.push(
                 "The loaded-module inventory summary reports incomplete coverage. Library comparison is skipped for this run.".to_string(),
             );
@@ -350,7 +396,7 @@ pub fn evidence_bundle_from_run(
             includes_descendants: has_windows_provenance,
         },
         coverage: EvidenceCoverage {
-            event_count: events.len() as u64,
+            event_count,
             event_counts_by_type,
             collector_sources: collector_sources.into_iter().collect(),
             limitations,
@@ -417,19 +463,53 @@ pub fn compare_baseline_to_run(
     current_run: &StoredRun,
     generated_at_ms: i64,
 ) -> Result<BehaviorDriftReport, String> {
-    use std::collections::BTreeSet;
-
     if baseline.source_run_id != baseline_run.run_id {
         return Err(format!(
             "Baseline source run '{}' does not match loaded run '{}'.",
             baseline.source_run_id, baseline_run.run_id
         ));
     }
+    if baseline_run.status != "completed" || baseline_run.ended_at_ms.is_none() {
+        return Err(format!(
+            "Baseline source run {} is no longer a completed run.",
+            baseline_run.run_id
+        ));
+    }
+    if !baseline
+        .application
+        .eq_ignore_ascii_case(&baseline_run.application)
+        || !baseline
+            .passport
+            .application
+            .eq_ignore_ascii_case(&baseline_run.application)
+        || !baseline
+            .passport
+            .passport_id
+            .eq(&baseline_run.passport.passport_id)
+        || !passport_observations_match(
+            &baseline.passport.observations,
+            &baseline_run.passport.observations,
+        )
+    {
+        return Err(
+            "Stored baseline identity or observations do not match its source run. Recreate the baseline from that run."
+                .to_string(),
+        );
+    }
     if current_run.status != "completed" || current_run.ended_at_ms.is_none() {
         return Err(format!(
             "Run {} is not completed; only completed runs can be compared.",
             current_run.run_id
         ));
+    }
+    if !current_run
+        .passport
+        .application
+        .eq_ignore_ascii_case(&current_run.application)
+    {
+        return Err(
+            "The current Runtime Passport application does not match its saved run.".to_string(),
+        );
     }
     if !baseline
         .application
@@ -442,8 +522,18 @@ pub fn compare_baseline_to_run(
     }
 
     // Validate the original evidence records on both sides before linking their IDs.
-    let _baseline_evidence = evidence_bundle_from_run(baseline_run, generated_at_ms)?;
+    let baseline_evidence = evidence_bundle_from_run(baseline_run, generated_at_ms)?;
     let current_evidence = evidence_bundle_from_run(current_run, generated_at_ms)?;
+    if !same_scope(&baseline.scope, &baseline_evidence.scope)
+        || baseline.coverage.event_count != baseline_evidence.coverage.event_count
+        || baseline.coverage.event_counts_by_type != baseline_evidence.coverage.event_counts_by_type
+        || baseline.coverage.collector_sources != baseline_evidence.coverage.collector_sources
+    {
+        return Err(
+            "Stored baseline scope or coverage does not match its source run. Recreate the baseline from that run."
+                .to_string(),
+        );
+    }
     let baseline_scope = baseline.scope.clone();
     let current_scope = current_evidence.scope.clone();
     let scope_matches = baseline_scope.platform == current_scope.platform
@@ -555,12 +645,15 @@ pub fn compare_baseline_to_run(
             &baseline.passport.observations.processes,
             &current_run.passport.observations.processes,
             has_process_provenance(&baseline.coverage.collector_sources)
-                && has_process_provenance(&current_evidence.coverage.collector_sources),
+                && has_process_provenance(&current_evidence.coverage.collector_sources)
+                && (baseline_scope.kind != "selected_process_tree_watch"
+                    || (process_watch_coverage_complete(baseline_run)
+                        && process_watch_coverage_complete(current_run))),
             baseline_run,
             current_run,
         );
         if skipped_categories.iter().any(|item| item == "processes") {
-            limitations.push("Process observations were skipped because both runs do not contain process-collector event provenance.".to_string());
+            limitations.push("Process observations were skipped because one or both runs lack process-collector provenance or complete process-watch queue coverage.".to_string());
         }
 
         let network_comparable = baseline.scope.kind == "selected_process_tree_watch"
@@ -722,6 +815,26 @@ fn filesystem_coverage_complete(run: &StoredRun) -> bool {
     inventory_summary_seen && watch_summary_seen
 }
 
+fn same_scope(left: &EvidenceScope, right: &EvidenceScope) -> bool {
+    left.platform == right.platform
+        && left.kind == right.kind
+        && left.root_pid == right.root_pid
+        && left.includes_descendants == right.includes_descendants
+}
+
+fn passport_observations_match(left: &PassportObservations, right: &PassportObservations) -> bool {
+    fn same_items(left: &[String], right: &[String]) -> bool {
+        let left: BTreeSet<&str> = left.iter().map(String::as_str).collect();
+        let right: BTreeSet<&str> = right.iter().map(String::as_str).collect();
+        left == right
+    }
+
+    same_items(&left.processes, &right.processes)
+        && same_items(&left.network_targets, &right.network_targets)
+        && same_items(&left.files, &right.files)
+        && same_items(&left.libraries, &right.libraries)
+}
+
 fn library_inventory_complete(run: &StoredRun) -> bool {
     let mut summaries = run.events.iter().filter(|event| {
         event.source == "windows_module_snapshot"
@@ -747,6 +860,27 @@ fn has_process_provenance(sources: &[String]) -> bool {
     sources
         .iter()
         .any(|source| source == "windows_process" || source == "windows_process_watch")
+}
+
+fn process_watch_loss_counts(run: &StoredRun) -> Option<(u64, u64, u64)> {
+    let mut summaries = run.events.iter().filter(|event| {
+        event.source == "windows_process_watch" && event.subject.as_deref() == Some("watch_summary")
+    });
+    let summary = summaries.next()?;
+    if summaries.next().is_some() {
+        return None;
+    }
+
+    let metadata = serde_json::from_str::<serde_json::Value>(&summary.metadata_json).ok()?;
+    Some((
+        metadata.get("dropped_start_events")?.as_u64()?,
+        metadata.get("dropped_exit_events")?.as_u64()?,
+        metadata.get("unpersisted_events_at_stop")?.as_u64()?,
+    ))
+}
+
+fn process_watch_coverage_complete(run: &StoredRun) -> bool {
+    process_watch_loss_counts(run) == Some((0, 0, 0))
 }
 
 fn compare_observation_category(
@@ -856,7 +990,10 @@ fn category_context_event_ids(run: &StoredRun, category: &str) -> Vec<String> {
         .events
         .iter()
         .filter(|event| match category {
-            "processes" => event.event_type.starts_with("process_"),
+            "processes" => {
+                event.event_type.starts_with("process_")
+                    && event.subject.as_deref() != Some("watch_summary")
+            }
             "network_targets" => {
                 event.event_type == "network_connection" || event.event_type == "dns_lookup"
             }
@@ -915,670 +1052,4 @@ fn matching_event_ids(
 }
 
 #[cfg(test)]
-mod evidence_bundle_tests {
-    use super::evidence_bundle_from_run;
-    use crate::model::{PassportObservations, RuntimePassport};
-    use crate::storage::{StoredEvent, StoredRun};
-
-    fn sample_run(status: &str) -> StoredRun {
-        StoredRun {
-            run_id: "watch-100-42".to_string(),
-            application: "demo.exe".to_string(),
-            started_at_ms: 100,
-            ended_at_ms: Some(200),
-            status: status.to_string(),
-            schema_version: "0.1".to_string(),
-            passport: RuntimePassport {
-                schema_version: "0.1".to_string(),
-                passport_id: "passport-watch-100-42".to_string(),
-                generated_at_ms: 200,
-                application: "demo.exe".to_string(),
-                observations: PassportObservations {
-                    processes: vec!["demo.exe".to_string()],
-                    network_targets: vec![],
-                    files: vec![],
-                    libraries: vec![],
-                },
-                changes: vec![],
-            },
-            events: vec![
-                StoredEvent {
-                    event_id: "process-event".to_string(),
-                    timestamp_ms: 110,
-                    event_type: "process_observed".to_string(),
-                    pid: Some(42),
-                    executable: Some("demo.exe".to_string()),
-                    subject: Some("process".to_string()),
-                    target: Some("demo.exe".to_string()),
-                    metadata_json: r#"{"root_pid":42,"depth":0}"#.to_string(),
-                    source: "windows_process_watch".to_string(),
-                    sensitivity: "SystemMetadata".to_string(),
-                },
-                StoredEvent {
-                    event_id: "network-event".to_string(),
-                    timestamp_ms: 120,
-                    event_type: "network_connection".to_string(),
-                    pid: Some(42),
-                    executable: Some("demo.exe".to_string()),
-                    subject: Some("tcp".to_string()),
-                    target: Some("203.0.113.10:443".to_string()),
-                    metadata_json: r#"{"protocol":"tcp","operation":"connect"}"#.to_string(),
-                    source: "windows_network_watch".to_string(),
-                    sensitivity: "SystemMetadata".to_string(),
-                },
-            ],
-        }
-    }
-
-    fn sample_filesystem_run(run_id: &str, initial_files: &[&str]) -> StoredRun {
-        let root = "C:/TraceFactTest";
-        let mut run = sample_run("completed");
-        run.run_id = run_id.to_string();
-        run.application = format!("directory:{root}");
-        run.started_at_ms = 1_000;
-        run.ended_at_ms = Some(2_000);
-        run.passport.passport_id = format!("passport-{run_id}");
-        run.passport.application = run.application.clone();
-        run.passport.observations.processes.clear();
-        run.passport.observations.network_targets.clear();
-        run.passport.observations.files = initial_files
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect();
-        run.events.clear();
-
-        run.events.push(StoredEvent {
-            event_id: format!("{run_id}-inventory-summary"),
-            timestamp_ms: 1_000,
-            event_type: "file_observed".to_string(),
-            pid: Some(0),
-            executable: Some("filesystem-observer".to_string()),
-            subject: Some("inventory_summary".to_string()),
-            target: None,
-            metadata_json: format!(r#"{{"operation":"inventory_summary","initial_inventory_truncated":false,"initial_inventory_unreadable":0,"watch_root":"{root}"}}"#),
-            source: "windows_filesystem_snapshot".to_string(),
-            sensitivity: "SystemMetadata".to_string(),
-        });
-        for (index, path) in initial_files.iter().enumerate() {
-            run.events.push(StoredEvent {
-                event_id: format!("{run_id}-present-{index}"),
-                timestamp_ms: 1_010 + index as i64,
-                event_type: "file_observed".to_string(),
-                pid: Some(0),
-                executable: Some("filesystem-observer".to_string()),
-                subject: Some("present_at_start".to_string()),
-                target: Some((*path).to_string()),
-                metadata_json: format!(r#"{{"operation":"present_at_start","entry_kind":"file","watch_root":"{root}"}}"#),
-                source: "windows_filesystem_snapshot".to_string(),
-                sensitivity: "PotentiallySensitive".to_string(),
-            });
-        }
-        run.events.push(StoredEvent {
-            event_id: format!("{run_id}-watch-summary"),
-            timestamp_ms: 2_000,
-            event_type: "file_change".to_string(),
-            pid: Some(0),
-            executable: Some("filesystem-observer".to_string()),
-            subject: Some("watch_summary".to_string()),
-            target: None,
-            metadata_json: format!(r#"{{"operation":"watch_summary","notification_queue_dropped":0,"notification_error_present":false,"filesystem_coverage_requires_review":false,"initial_inventory_truncated":false,"initial_inventory_unreadable":0,"watch_root":"{root}"}}"#),
-            source: "windows_filesystem_watch".to_string(),
-            sensitivity: "SystemMetadata".to_string(),
-        });
-        run
-    }
-
-    #[test]
-    fn evidence_bundle_preserves_provenance_and_coverage_limitations() {
-        let run = sample_run("completed");
-        let bundle = evidence_bundle_from_run(&run, 300).expect("bundle should be built");
-
-        assert_eq!(bundle.bundle_schema_version, "1.0");
-        assert_eq!(bundle.run.run_id, "watch-100-42");
-        assert_eq!(bundle.scope.platform, "windows");
-        assert_eq!(bundle.scope.kind, "selected_process_tree_watch");
-        assert_eq!(bundle.scope.root_pid, Some(42));
-        assert!(bundle.scope.includes_descendants);
-        assert_eq!(bundle.coverage.event_count, 2);
-        assert_eq!(
-            bundle.coverage.event_counts_by_type["network_connection"],
-            1
-        );
-        assert_eq!(bundle.coverage.collector_sources.len(), 2);
-        assert_eq!(bundle.events[1].metadata["protocol"], "tcp");
-        assert!(bundle
-            .coverage
-            .limitations
-            .iter()
-            .any(|note| note.contains("loaded-library observation was not captured in this run")));
-    }
-
-    #[test]
-    fn incomplete_source_run_is_explicit_in_evidence_limitations() {
-        let run = sample_run("interrupted");
-        let bundle = evidence_bundle_from_run(&run, 300).expect("bundle should be built");
-        assert!(bundle
-            .coverage
-            .limitations
-            .iter()
-            .any(|note| note.contains("interrupted")));
-    }
-
-    #[test]
-    fn malformed_stored_metadata_prevents_silent_export() {
-        let mut run = sample_run("completed");
-        run.events[0].metadata_json = "{not valid JSON".to_string();
-        let error = evidence_bundle_from_run(&run, 300).expect_err("invalid metadata must fail");
-        assert!(error.contains("invalid metadata JSON"));
-    }
-
-    #[test]
-    fn baseline_normalizes_observations_and_clears_old_changes() {
-        let mut run = sample_run("completed");
-        run.passport.observations.processes = vec![
-            "z.exe".to_string(),
-            "a.exe".to_string(),
-            "a.exe".to_string(),
-        ];
-        run.passport.changes.push(crate::model::BehaviorChange {
-            kind: crate::model::ChangeKind::Added,
-            category: "process".to_string(),
-            subject: "old-finding.exe".to_string(),
-            reason: "test finding".to_string(),
-        });
-        let baseline = super::baseline_from_run(&run, "test baseline", 300)
-            .expect("completed run should become a baseline");
-
-        assert_eq!(baseline.name, "test baseline");
-        assert_eq!(baseline.source_run_id, run.run_id);
-        assert_eq!(
-            baseline.passport.observations.processes,
-            vec!["a.exe".to_string(), "z.exe".to_string()]
-        );
-        assert!(baseline.passport.changes.is_empty());
-        assert_eq!(baseline.coverage.event_count, 2);
-        assert!(baseline
-            .coverage
-            .limitations
-            .iter()
-            .any(|item| item.contains("loaded-library observation was not captured in this run")));
-    }
-
-    #[test]
-    fn baseline_rejects_incomplete_runs() {
-        let run = sample_run("interrupted");
-        let error = super::baseline_from_run(&run, "test baseline", 300)
-            .expect_err("interrupted runs must not become baselines");
-        assert!(error.contains("only completed runs"));
-    }
-
-    #[test]
-    fn non_object_metadata_is_rejected_by_evidence_export() {
-        let mut run = sample_run("completed");
-        run.events[0].metadata_json = "42".to_string();
-        let error = evidence_bundle_from_run(&run, 300).expect_err("non-object metadata must fail");
-        assert!(error.contains("must be a JSON object"));
-    }
-
-    #[test]
-    fn comparison_reports_added_and_not_observed_items_with_event_links() {
-        let mut baseline_run = sample_run("completed");
-        baseline_run.passport.observations.processes = vec!["demo.exe".into(), "old.exe".into()];
-        baseline_run.passport.observations.network_targets = vec!["203.0.113.10:443".into()];
-        baseline_run.events.push(StoredEvent {
-            event_id: "old-process-event".to_string(),
-            timestamp_ms: 130,
-            event_type: "process_start".to_string(),
-            pid: Some(43),
-            executable: Some("old.exe".to_string()),
-            subject: Some("process".to_string()),
-            target: Some("old.exe".to_string()),
-            metadata_json: r#"{"depth":1,"root_pid":42}"#.to_string(),
-            source: "windows_process_watch".to_string(),
-            sensitivity: "SystemMetadata".to_string(),
-        });
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-
-        let mut current_run = baseline_run.clone();
-        current_run.run_id = "watch-200-42".to_string();
-        current_run.started_at_ms = 200;
-        current_run.ended_at_ms = Some(400);
-        current_run.passport.passport_id = "passport-watch-200-42".to_string();
-        current_run.passport.observations.processes = vec!["demo.exe".into(), "new.exe".into()];
-        current_run.passport.observations.network_targets = vec!["198.51.100.20:8443".into()];
-        current_run
-            .events
-            .retain(|event| event.event_id != "old-process-event");
-        let network_event = current_run
-            .events
-            .iter_mut()
-            .find(|event| event.event_type == "network_connection")
-            .expect("sample run has network event");
-        network_event.event_id = "current-network-event".to_string();
-        network_event.target = Some("198.51.100.20:8443".to_string());
-        current_run.events.push(StoredEvent {
-            event_id: "new-process-event".to_string(),
-            timestamp_ms: 230,
-            event_type: "process_start".to_string(),
-            pid: Some(44),
-            executable: Some("new.exe".to_string()),
-            subject: Some("process".to_string()),
-            target: Some("new.exe".to_string()),
-            metadata_json: r#"{"depth":1,"root_pid":42}"#.to_string(),
-            source: "windows_process_watch".to_string(),
-            sensitivity: "SystemMetadata".to_string(),
-        });
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
-            .expect("comparable completed runs should compare");
-        assert!(report.comparable);
-        assert!(report
-            .compared_categories
-            .contains(&"processes".to_string()));
-        assert!(report
-            .compared_categories
-            .contains(&"network_targets".to_string()));
-        let added_process = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "processes"
-                    && finding.kind == "added"
-                    && finding.observation == "new.exe"
-            })
-            .expect("new process finding should exist");
-        assert_eq!(added_process.current_event_ids, vec!["new-process-event"]);
-        let not_observed_process = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "processes"
-                    && finding.kind == "not_observed"
-                    && finding.observation == "old.exe"
-            })
-            .expect("not-observed process finding should exist");
-        assert_eq!(
-            not_observed_process.baseline_event_ids,
-            vec!["old-process-event"]
-        );
-        assert!(not_observed_process.current_event_ids.is_empty());
-        assert!(!not_observed_process.current_context_event_ids.is_empty());
-        assert!(not_observed_process.explanation.contains("does not prove"));
-        assert!(report
-            .findings
-            .windows(2)
-            .all(|pair| pair[0].finding_id.as_str() < pair[1].finding_id.as_str()));
-    }
-
-    #[test]
-    fn scope_mismatch_skips_behavior_findings() {
-        let baseline_run = sample_run("completed");
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-        let mut current_run = baseline_run.clone();
-        current_run.run_id = "snap-200".to_string();
-        current_run.passport.passport_id = "passport-snap-200".to_string();
-        for event in &mut current_run.events {
-            event.source = "windows_process".to_string();
-        }
-        current_run
-            .events
-            .retain(|event| event.event_type != "network_connection");
-        current_run.passport.observations.network_targets.clear();
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
-            .expect("scope mismatch should be reported, not misclassified as drift");
-        assert!(!report.comparable);
-        assert!(report.findings.is_empty());
-        assert!(report
-            .coverage_changes
-            .iter()
-            .any(|change| change.kind == "scope_changed"));
-    }
-
-    #[test]
-    fn network_non_observations_are_skipped_without_provenance_in_both_runs() {
-        let mut baseline_run = sample_run("completed");
-        baseline_run.passport.observations.network_targets = vec!["203.0.113.10:443".into()];
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-        let mut current_run = sample_run("completed");
-        current_run.run_id = "watch-200-42".to_string();
-        current_run
-            .events
-            .retain(|event| event.event_type != "network_connection");
-        current_run.passport.observations.network_targets.clear();
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
-            .expect("comparison should complete while reporting limited coverage");
-        assert!(report
-            .skipped_categories
-            .contains(&"network_targets".to_string()));
-        assert!(
-            !report
-                .findings
-                .iter()
-                .any(|finding| finding.category == "network_targets"
-                    && finding.kind == "not_observed")
-        );
-        assert!(report
-            .limitations
-            .iter()
-            .any(|item| item.contains("not proof")));
-    }
-
-    #[test]
-    fn snapshot_network_limitations_do_not_refer_to_watch_runs() {
-        let mut baseline_run = sample_run("completed");
-        for event in &mut baseline_run.events {
-            event.source = "windows_process".to_string();
-        }
-        baseline_run
-            .events
-            .retain(|event| event.event_type != "network_connection");
-        baseline_run.passport.observations.network_targets.clear();
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed snapshot should become baseline");
-
-        let mut current_run = baseline_run.clone();
-        current_run.run_id = "snap-200".to_string();
-        current_run.passport.passport_id = "passport-snap-200".to_string();
-        current_run.started_at_ms = 200;
-        current_run.ended_at_ms = Some(400);
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
-            .expect("snapshot comparison should complete");
-        assert!(report
-            .skipped_categories
-            .contains(&"network_targets".to_string()));
-        assert!(report
-            .limitations
-            .iter()
-            .any(|item| { item.contains("network observation coverage for both runs") }));
-        let filesystem_library_limitations = report
-            .limitations
-            .iter()
-            .filter(|item| {
-                item.to_lowercase().contains("filesystem")
-                    && item.to_lowercase().contains("loaded-library")
-            })
-            .count();
-        assert_eq!(filesystem_library_limitations, 1);
-        assert!(!report
-            .limitations
-            .iter()
-            .any(|item| item.contains("both watch runs")));
-    }
-
-    #[test]
-    fn windows_case_only_observation_changes_do_not_create_findings() {
-        let mut baseline_run = sample_run("completed");
-        baseline_run.passport.observations.processes = vec!["DEMO.EXE".into()];
-        baseline_run.passport.observations.network_targets = vec!["2001:DB8::1:443".into()];
-        let network_event = baseline_run
-            .events
-            .iter_mut()
-            .find(|event| event.event_type == "network_connection")
-            .expect("sample run has network event");
-        network_event.target = Some("2001:DB8::1:443".into());
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-
-        let mut current_run = baseline_run.clone();
-        current_run.run_id = "watch-case-variant".to_string();
-        current_run.passport.observations.processes = vec!["demo.exe".into()];
-        current_run.passport.observations.network_targets = vec!["2001:db8::1:443".into()];
-        let network_event = current_run
-            .events
-            .iter_mut()
-            .find(|event| event.event_type == "network_connection")
-            .expect("sample run has network event");
-        network_event.event_id = "network-case-variant".to_string();
-        network_event.target = Some("2001:db8::1:443".into());
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 500)
-            .expect("case-only variations should compare");
-        assert!(report.comparable);
-        assert!(report.findings.is_empty());
-    }
-
-    #[test]
-    fn directory_watch_comparison_reports_path_additions_and_not_observed_paths() {
-        let baseline_run = sample_filesystem_run("filesystem-baseline", &["old.txt"]);
-        let baseline = super::baseline_from_run(&baseline_run, "directory baseline", 3_000)
-            .expect("completed filesystem run should become a baseline");
-
-        let mut current_run = sample_filesystem_run("filesystem-current", &["new.txt"]);
-        current_run.events.push(StoredEvent {
-            event_id: "current-remove-old".to_string(),
-            timestamp_ms: 1_500,
-            event_type: "file_change".to_string(),
-            pid: Some(0),
-            executable: Some("filesystem-observer".to_string()),
-            subject: Some("removed".to_string()),
-            target: Some("old.txt".to_string()),
-            metadata_json: r#"{"operation":"removed","watch_root":"C:\\TraceFactTest"}"#
-                .to_string(),
-            source: "windows_filesystem_watch".to_string(),
-            sensitivity: "PotentiallySensitive".to_string(),
-        });
-        current_run.events.push(StoredEvent {
-            event_id: "current-create-new".to_string(),
-            timestamp_ms: 1_600,
-            event_type: "file_change".to_string(),
-            pid: Some(0),
-            executable: Some("filesystem-observer".to_string()),
-            subject: Some("created".to_string()),
-            target: Some("new.txt".to_string()),
-            metadata_json:
-                r#"{"operation":"created","entry_kind":"file","watch_root":"C:\\TraceFactTest"}"#
-                    .to_string(),
-            source: "windows_filesystem_watch".to_string(),
-            sensitivity: "PotentiallySensitive".to_string(),
-        });
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
-            .expect("matching directory scopes should compare");
-        assert!(report.comparable);
-        assert!(report.compared_categories.contains(&"files".to_string()));
-        assert!(report.skipped_categories.contains(&"processes".to_string()));
-        assert!(report
-            .skipped_categories
-            .contains(&"network_targets".to_string()));
-
-        let added = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "files"
-                    && finding.kind == "added"
-                    && finding.observation == "new.txt"
-            })
-            .expect("new file should be reported");
-        assert!(added
-            .current_event_ids
-            .contains(&"current-create-new".to_string()));
-
-        let not_observed = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "files"
-                    && finding.kind == "not_observed"
-                    && finding.observation == "old.txt"
-            })
-            .expect("removed old file should be not-observed in the current Passport");
-        assert!(not_observed
-            .baseline_event_ids
-            .iter()
-            .any(|id| id.contains("present-0")));
-        assert!(not_observed.current_event_ids.is_empty());
-        assert!(not_observed
-            .current_context_event_ids
-            .contains(&"current-remove-old".to_string()));
-        assert!(not_observed.explanation.contains("does not prove"));
-    }
-
-    fn sample_module_snapshot_run(run_id: &str, libraries: &[&str], complete: bool) -> StoredRun {
-        let mut run = sample_run("completed");
-        run.run_id = run_id.to_string();
-        run.started_at_ms = 1_000;
-        run.ended_at_ms = Some(2_000);
-        run.passport.passport_id = format!("passport-{run_id}");
-        run.passport.observations.network_targets.clear();
-        run.passport.observations.libraries =
-            libraries.iter().map(|path| (*path).to_string()).collect();
-        run.events
-            .retain(|event| event.event_type == "process_observed");
-        run.events[0].source = "windows_process".to_string();
-
-        for (index, path) in libraries.iter().enumerate() {
-            run.events.push(StoredEvent {
-                event_id: format!("{run_id}-module-{index}"),
-                timestamp_ms: 1_100 + index as i64,
-                event_type: "library_loaded".to_string(),
-                pid: Some(42),
-                executable: Some("demo.exe".to_string()),
-                subject: Some("loaded_module".to_string()),
-                target: Some((*path).to_string()),
-                metadata_json:
-                    r#"{"root_pid":42,"observation_method":"windows_toolhelp_module_snapshot"}"#
-                        .to_string(),
-                source: "windows_module_snapshot".to_string(),
-                sensitivity: "PotentiallySensitive".to_string(),
-            });
-        }
-        run.events.push(StoredEvent {
-            event_id: format!("{run_id}-module-summary"),
-            timestamp_ms: 1_999,
-            event_type: "library_inventory_status".to_string(),
-            pid: Some(42),
-            executable: Some("demo.exe".to_string()),
-            subject: Some("inventory_summary".to_string()),
-            target: None,
-            metadata_json: format!(
-                r#"{{"root_pid":42,"complete":{complete},"observed_modules":{}}}"#,
-                libraries.len()
-            ),
-            source: "windows_module_snapshot".to_string(),
-            sensitivity: "SystemMetadata".to_string(),
-        });
-        run
-    }
-
-    #[test]
-    fn complete_module_inventories_compare_with_event_links() {
-        let baseline_run = sample_module_snapshot_run(
-            "module-baseline",
-            &[r#"C:\Windows\System32\kernel32.dll"#, r#"C:\App\old.dll"#],
-            true,
-        );
-        let baseline = super::baseline_from_run(&baseline_run, "module stable", 3_000)
-            .expect("complete module snapshot should become a baseline");
-        let current_run = sample_module_snapshot_run(
-            "module-current",
-            &[r#"c:/windows/system32/KERNEL32.DLL"#, r#"C:\App\new.dll"#],
-            true,
-        );
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
-            .expect("complete module inventories should compare");
-        assert!(report
-            .compared_categories
-            .contains(&"libraries".to_string()));
-        let added = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "libraries"
-                    && finding.kind == "added"
-                    && finding.observation.ends_with("new.dll")
-            })
-            .expect("new module should be reported");
-        assert!(added
-            .current_event_ids
-            .contains(&"module-current-module-1".to_string()));
-        let not_observed = report
-            .findings
-            .iter()
-            .find(|finding| {
-                finding.category == "libraries"
-                    && finding.kind == "not_observed"
-                    && finding.observation.ends_with("old.dll")
-            })
-            .expect("baseline module should be marked not observed");
-        assert!(not_observed
-            .baseline_event_ids
-            .contains(&"module-baseline-module-1".to_string()));
-        assert!(not_observed.explanation.contains("does not prove"));
-        assert!(not_observed
-            .current_context_event_ids
-            .contains(&"module-current-module-summary".to_string()));
-    }
-
-    #[test]
-    fn incomplete_module_inventory_is_not_compared() {
-        let baseline_run =
-            sample_module_snapshot_run("module-baseline", &[r#"C:\App\old.dll"#], true);
-        let baseline = super::baseline_from_run(&baseline_run, "module stable", 3_000)
-            .expect("complete module snapshot should become a baseline");
-        let current_run = sample_module_snapshot_run("module-current", &[], false);
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 4_000)
-            .expect("incomplete inventory should produce a limited report");
-        assert!(report.skipped_categories.contains(&"libraries".to_string()));
-        assert!(!report
-            .findings
-            .iter()
-            .any(|finding| finding.category == "libraries"));
-        assert!(report
-            .limitations
-            .iter()
-            .any(|item| item.contains("complete point-in-time module inventory")));
-    }
-
-    #[test]
-    fn comparison_rejects_incomplete_runs_and_different_applications() {
-        let baseline_run = sample_run("completed");
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-
-        let mut interrupted = sample_run("interrupted");
-        interrupted.run_id = "watch-interrupted".to_string();
-        interrupted.ended_at_ms = None;
-        let error = super::compare_baseline_to_run(&baseline, &baseline_run, &interrupted, 500)
-            .expect_err("interrupted runs must not be compared as final behavior");
-        assert!(error.contains("only completed runs can be compared"));
-
-        let mut other_application = sample_run("completed");
-        other_application.run_id = "watch-other-app".to_string();
-        other_application.application = "other.exe".to_string();
-        let error =
-            super::compare_baseline_to_run(&baseline, &baseline_run, &other_application, 500)
-                .expect_err("different applications must not be compared");
-        assert!(error.contains("does not match baseline application"));
-    }
-
-    #[test]
-    fn reordered_observations_and_changed_timestamps_do_not_create_findings() {
-        let baseline_run = sample_run("completed");
-        let baseline = super::baseline_from_run(&baseline_run, "stable", 300)
-            .expect("completed run should become baseline");
-        let mut current_run = baseline_run.clone();
-        current_run.run_id = "watch-300-42".to_string();
-        current_run.started_at_ms += 10_000;
-        current_run.ended_at_ms = Some(10_200);
-        current_run.passport.generated_at_ms += 10_000;
-        current_run.passport.observations.processes.reverse();
-        current_run
-            .events
-            .iter_mut()
-            .for_each(|event| event.timestamp_ms += 10_000);
-
-        let report = super::compare_baseline_to_run(&baseline, &baseline_run, &current_run, 20_000)
-            .expect("equivalent observation sets should compare");
-        assert!(report.comparable);
-        assert!(report.findings.is_empty());
-    }
-}
+mod evidence_bundle_tests;
