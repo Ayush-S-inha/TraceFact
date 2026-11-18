@@ -8,13 +8,13 @@ TraceFact watches an application while it runs and builds a local record of its 
 
 ```text
 WHAT YOU EXPECTED
-       ↓
+       |
 WHAT ACTUALLY HAPPENED
-       ↓
+       |
 WHAT CHANGED
-       ↓
+       |
 WHY IT MATTERS
-       ↓
+       |
 PROOF
 ```
 
@@ -26,7 +26,7 @@ The Windows process collector is working in two modes.
 
 `tracefact watch <pid>` keeps the selected process tree under observation. It records process start and exit events as they happen, saves them to SQLite, and finishes the run with an updated Runtime Passport.
 
-The process observer records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines.
+The process observer records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines. Its WMI event queue holds up to 4,096 lifecycle events; overflow and events left queued at shutdown appear in a process-watch summary. Process-set comparison is skipped when the summary reports loss or when an older run has no summary.
 
 The watch command also includes an experimental Windows TCP observer. It records connection metadata for processes in the selected tree, including endpoint addresses and ports. It does not store network payloads. The network observer requires an Administrator PowerShell and is still being validated on Windows systems.
 
