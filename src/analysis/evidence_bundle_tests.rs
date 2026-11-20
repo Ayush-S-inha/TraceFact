@@ -159,8 +159,8 @@ fn process_queue_loss_is_reported_and_skips_process_comparison() {
         .expect("sample run has a process coverage summary");
     summary.metadata_json = r#"{"operation":"watch_summary","root_pid":42,"dropped_start_events":3,"dropped_exit_events":1,"unpersisted_events_at_stop":2,"queue_capacity":4096}"#.to_string();
 
-    let bundle = evidence_bundle_from_run(&baseline_run, 300)
-        .expect("queue loss should remain exportable");
+    let bundle =
+        evidence_bundle_from_run(&baseline_run, 300).expect("queue loss should remain exportable");
     assert!(bundle.coverage.limitations.iter().any(|note| {
         note.contains("did not persist 3 start-event records, 1 exit-event records, and 2 queued or failed event records")
     }));
@@ -182,8 +182,8 @@ fn legacy_process_watch_without_summary_skips_process_comparison() {
     baseline_run
         .events
         .retain(|event| event.subject.as_deref() != Some("watch_summary"));
-    let bundle = evidence_bundle_from_run(&baseline_run, 300)
-        .expect("legacy run should remain exportable");
+    let bundle =
+        evidence_bundle_from_run(&baseline_run, 300).expect("legacy run should remain exportable");
     assert!(bundle
         .coverage
         .limitations
@@ -571,8 +571,7 @@ fn sample_module_snapshot_run(run_id: &str, libraries: &[&str], complete: bool) 
     run.passport.observations.libraries =
         libraries.iter().map(|path| (*path).to_string()).collect();
     run.events.retain(|event| {
-        event.event_type == "process_observed"
-            && event.subject.as_deref() != Some("watch_summary")
+        event.event_type == "process_observed" && event.subject.as_deref() != Some("watch_summary")
     });
     run.events[0].source = "windows_process".to_string();
 
