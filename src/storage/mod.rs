@@ -1,7 +1,10 @@
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -17,6 +20,8 @@ pub enum StorageError {
     Sql(rusqlite::Error),
     Json(serde_json::Error),
     InvalidValue(String),
+    // The first write hit SQLITE_FULL and its one recovery attempt also failed.
+    StorageFullRecovery(String),
 }
 
 impl Display for StorageError {
@@ -26,6 +31,9 @@ impl Display for StorageError {
             Self::Sql(error) => write!(formatter, "storage database error: {error}"),
             Self::Json(error) => write!(formatter, "storage serialization error: {error}"),
             Self::InvalidValue(message) => write!(formatter, "storage value error: {message}"),
+            Self::StorageFullRecovery(message) => {
+                write!(formatter, "storage-full recovery error: {message}")
+            }
         }
     }
 }
@@ -134,17 +142,298 @@ pub fn open_default() -> Result<(Connection, PathBuf), StorageError> {
         StorageError::InvalidValue("default database path has no parent directory".to_string())
     })?;
     std::fs::create_dir_all(parent)?;
+    ensure_storage_reserve(&path);
     let connection = initialize(path.to_string_lossy().as_ref())?;
     Ok((connection, path))
 }
 
 const CURRENT_SCHEMA_VERSION: i64 = 2;
+const DEFAULT_MAX_RUNS: u64 = 500;
+const DEFAULT_MAX_DATABASE_MB: u64 = 1024;
+const SQLITE_MAX_PAGE_COUNT: i64 = 4_294_967_294;
+const STORAGE_RESERVE_BYTES: usize = 1024 * 1024;
+const STORAGE_RESERVE_MARKER: &[u8] = b"TRACEFACT_STORAGE_RESERVE_V1\n";
+
+#[derive(Debug, Clone)]
+pub struct StorageStatus {
+    pub database_bytes: u64,
+    pub database_limit_bytes: Option<u64>,
+    pub emergency_reserve_bytes: u64,
+    pub run_count: u64,
+    pub protected_run_count: u64,
+    pub max_runs: u64,
+}
+
+fn configured_limit(name: &str, default: u64) -> Result<u64, StorageError> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    value
+        .to_string_lossy()
+        .parse::<u64>()
+        .map_err(|_| StorageError::InvalidValue(format!("{name} must be a non-negative integer")))
+}
+
+fn configured_max_runs() -> Result<u64, StorageError> {
+    configured_limit("TRACEFACT_MAX_RUNS", DEFAULT_MAX_RUNS)
+}
+
+fn configured_max_database_mb() -> Result<u64, StorageError> {
+    configured_limit("TRACEFACT_MAX_DATABASE_MB", DEFAULT_MAX_DATABASE_MB)
+}
+
+fn configure_database_limit(connection: &Connection) -> Result<(), StorageError> {
+    let limit_mb = configured_max_database_mb()?;
+    let max_pages = if limit_mb == 0 {
+        SQLITE_MAX_PAGE_COUNT
+    } else {
+        let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let page_size = u64::try_from(page_size).unwrap_or(4096);
+        let max_bytes = limit_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+            StorageError::InvalidValue("database size limit is too large".to_string())
+        })?;
+        i64::try_from((max_bytes / page_size).max(1)).map_err(|_| {
+            StorageError::InvalidValue(
+                "database size limit exceeds SQLite's page limit".to_string(),
+            )
+        })?
+    };
+    connection.pragma_update(None, "max_page_count", max_pages)?;
+    Ok(())
+}
+
+fn reserve_path(database_path: &Path) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push(".reserve");
+    PathBuf::from(path)
+}
+
+// Keep a preallocated file outside SQLite so a full volume can still finalize a run.
+fn ensure_storage_reserve(database_path: &Path) {
+    let path = reserve_path(database_path);
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) else {
+        return;
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(STORAGE_RESERVE_MARKER)?;
+        let block = [0_u8; 64 * 1024];
+        for _ in 0..(STORAGE_RESERVE_BYTES / block.len()) {
+            file.write_all(&block)?;
+        }
+        file.sync_all()
+    })();
+    if write_result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn release_storage_reserve(database_path: &Path) -> bool {
+    let path = reserve_path(database_path);
+    let Ok(mut file) = File::open(&path) else {
+        return false;
+    };
+    let mut marker = vec![0_u8; STORAGE_RESERVE_MARKER.len()];
+    if file.read_exact(&mut marker).is_err() || marker.as_slice() != STORAGE_RESERVE_MARKER {
+        return false;
+    }
+    drop(file);
+    fs::remove_file(path).is_ok()
+}
+
+fn connection_path(connection: &Connection) -> Option<PathBuf> {
+    let raw = connection.path()?;
+    if raw.is_empty() || raw == ":memory:" || raw.starts_with("file:") {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+fn is_storage_full(error: &StorageError) -> bool {
+    match error {
+        StorageError::Sql(rusqlite::Error::SqliteFailure(code, _)) => {
+            code.extended_code & 0xff == 13
+        }
+        StorageError::StorageFullRecovery(_) => true,
+        _ => false,
+    }
+}
+
+fn with_storage_space_recovery<F>(
+    connection: &mut Connection,
+    mut operation: F,
+) -> Result<(), StorageError>
+where
+    F: FnMut(&mut Connection, bool) -> Result<(), StorageError>,
+{
+    match operation(connection, false) {
+        Ok(()) => Ok(()),
+        Err(error) if is_storage_full(&error) => {
+            let path = connection_path(connection);
+            if let Some(path) = &path {
+                release_storage_reserve(path);
+            }
+            match operation(connection, true) {
+                Ok(()) => {
+                    if let Some(path) = &path {
+                        ensure_storage_reserve(path);
+                    }
+                    Ok(())
+                }
+                Err(retry_error) => Err(StorageError::StorageFullRecovery(format!(
+                    "retry after releasing the emergency reserve failed: {retry_error}; original error: {error}"
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn prune_runs(
+    transaction: &rusqlite::Transaction<'_>,
+    max_runs: u64,
+    current_run_id: &str,
+    additional_runs: u64,
+) -> Result<usize, StorageError> {
+    if max_runs == 0 {
+        return Ok(0);
+    }
+    let max_runs = i64::try_from(max_runs).map_err(|_| {
+        StorageError::InvalidValue("TRACEFACT_MAX_RUNS exceeds the supported range".to_string())
+    })?;
+    let run_count: i64 = transaction.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+    let projected_count = run_count
+        .saturating_add(i64::try_from(additional_runs).unwrap_or(i64::MAX));
+    let excess = projected_count.saturating_sub(max_runs);
+    if excess == 0 {
+        return Ok(0);
+    }
+
+    Ok(transaction.execute(
+        "DELETE FROM runs
+          WHERE run_id IN (
+              SELECT r.run_id
+                FROM runs r
+               WHERE r.status <> 'running'
+                 AND r.run_id <> ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM baselines b WHERE b.source_run_id = r.run_id
+                 )
+                 AND r.run_id NOT IN (
+                     SELECT latest.run_id
+                       FROM runs latest
+                      WHERE latest.status = 'completed'
+                        AND latest.ended_at_ms IS NOT NULL
+                      ORDER BY latest.started_at_ms DESC, latest.run_id DESC
+                      LIMIT 1
+                 )
+                 AND r.run_id NOT IN (
+                     SELECT latest.run_id
+                       FROM runs latest
+                      ORDER BY latest.started_at_ms DESC, latest.run_id DESC
+                      LIMIT 1
+                 )
+               ORDER BY r.started_at_ms ASC, r.run_id ASC
+               LIMIT ?2
+          )",
+        params![current_run_id, excess],
+    )?)
+}
+
+fn cleanup_storage_pressure(
+    connection: &mut Connection,
+    protected_run_id: &str,
+) -> Result<(), StorageError> {
+    cleanup_storage_pressure_with_limit(
+        connection,
+        protected_run_id,
+        configured_max_runs()?,
+    )
+}
+
+fn cleanup_storage_pressure_with_limit(
+    connection: &mut Connection,
+    protected_run_id: &str,
+    max_runs: u64,
+) -> Result<(), StorageError> {
+    if max_runs == 0 {
+        return Ok(());
+    }
+
+    loop {
+        let transaction = connection.transaction()?;
+        let run_count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+        let retention_target = u64::try_from(run_count).unwrap_or(0);
+        let deleted = prune_runs(&transaction, retention_target, protected_run_id, 1)?;
+        transaction.commit()?;
+        if deleted == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn add_file_size(total: &mut u64, path: &Path) {
+    if let Ok(metadata) = fs::metadata(path) {
+        *total = total.saturating_add(metadata.len());
+    }
+}
+
+pub fn storage_status(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<StorageStatus, StorageError> {
+    let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let max_pages: i64 = connection.pragma_query_value(None, "max_page_count", |row| row.get(0))?;
+    let max_database_mb = configured_max_database_mb()?;
+    let mut database_bytes = 0_u64;
+    add_file_size(&mut database_bytes, database_path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar = database_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        add_file_size(&mut database_bytes, Path::new(&sidecar));
+    }
+    let reserve = reserve_path(database_path);
+    let emergency_reserve_bytes = fs::metadata(reserve).map_or(0, |metadata| metadata.len());
+    let run_count: i64 = connection.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+    let protected_run_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM runs r
+          WHERE r.status = 'running'
+             OR EXISTS (SELECT 1 FROM baselines b WHERE b.source_run_id = r.run_id)
+             OR r.run_id IN (
+                 SELECT latest.run_id FROM runs latest
+                  WHERE latest.status = 'completed' AND latest.ended_at_ms IS NOT NULL
+                  ORDER BY latest.started_at_ms DESC, latest.run_id DESC LIMIT 1
+             )
+             OR r.run_id IN (
+                 SELECT latest.run_id FROM runs latest
+                  ORDER BY latest.started_at_ms DESC, latest.run_id DESC LIMIT 1
+             )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(StorageStatus {
+        database_bytes,
+        database_limit_bytes: (max_database_mb > 0).then(|| {
+            u64::try_from(page_size).unwrap_or(4096)
+                .saturating_mul(u64::try_from(max_pages).unwrap_or(0))
+        }),
+        emergency_reserve_bytes,
+        run_count: u64::try_from(run_count).unwrap_or(0),
+        protected_run_count: u64::try_from(protected_run_count).unwrap_or(0),
+        max_runs: configured_max_runs()?,
+    })
+}
 
 pub fn initialize(path: &str) -> Result<Connection, StorageError> {
     let mut connection = Connection::open(path)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
     // Enable referential integrity before beginning migrations.
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     apply_migrations(&mut connection)?;
+    configure_database_limit(&connection)?;
     Ok(connection)
 }
 
@@ -228,43 +517,47 @@ pub fn begin_run_with_events(
     passport: &RuntimePassport,
     initial_events: &[RuntimeEvent],
 ) -> Result<(), StorageError> {
-    let transaction = connection.transaction()?;
+    with_storage_space_recovery(connection, |connection, retry_after_full| {
+        if retry_after_full {
+            cleanup_storage_pressure(connection, &snapshot.snapshot_id)?;
+        }
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &snapshot.snapshot_id,
+                &snapshot.application,
+                snapshot.started_at_ms,
+                snapshot.ended_at_ms,
+                &snapshot.schema_version,
+                if snapshot.ended_at_ms.is_some() {
+                    "completed"
+                } else {
+                    "running"
+                },
+            ],
+        )?;
 
-    transaction.execute(
-        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            &snapshot.snapshot_id,
-            &snapshot.application,
-            snapshot.started_at_ms,
-            snapshot.ended_at_ms,
-            &snapshot.schema_version,
-            if snapshot.ended_at_ms.is_some() {
-                "completed"
-            } else {
-                "running"
-            },
-        ],
-    )?;
+        let passport_json = serde_json::to_string(passport)?;
+        transaction.execute(
+            "INSERT INTO passports (passport_id, run_id, generated_at_ms, passport_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &passport.passport_id,
+                &snapshot.snapshot_id,
+                passport.generated_at_ms,
+                passport_json,
+            ],
+        )?;
 
-    let passport_json = serde_json::to_string(passport)?;
-    transaction.execute(
-        "INSERT INTO passports (passport_id, run_id, generated_at_ms, passport_json)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            &passport.passport_id,
-            &snapshot.snapshot_id,
-            passport.generated_at_ms,
-            passport_json,
-        ],
-    )?;
-
-    for event in initial_events {
-        insert_event(&transaction, &snapshot.snapshot_id, event)?;
-    }
-
-    transaction.commit()?;
-    Ok(())
+        for event in initial_events {
+            insert_event(&transaction, &snapshot.snapshot_id, event)?;
+        }
+        prune_runs(&transaction, configured_max_runs()?, &snapshot.snapshot_id, 0)?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 pub fn append_event(
@@ -272,10 +565,15 @@ pub fn append_event(
     run_id: &str,
     event: &RuntimeEvent,
 ) -> Result<(), StorageError> {
-    let transaction = connection.transaction()?;
-    insert_event(&transaction, run_id, event)?;
-    transaction.commit()?;
-    Ok(())
+    with_storage_space_recovery(connection, |connection, retry_after_full| {
+        if retry_after_full {
+            cleanup_storage_pressure(connection, run_id)?;
+        }
+        let transaction = connection.transaction()?;
+        insert_event(&transaction, run_id, event)?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 pub fn finish_run(
@@ -300,39 +598,82 @@ pub fn finish_run_with_status(
         )));
     }
 
+    let result = with_storage_space_recovery(connection, |connection, retry_after_full| {
+        if retry_after_full {
+            cleanup_storage_pressure(connection, run_id)?;
+        }
+        let transaction = connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE runs SET ended_at_ms = ?1, status = ?2 WHERE run_id = ?3",
+            params![ended_at_ms, status, run_id],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidValue(format!(
+                "run {run_id} was not found while finishing the run"
+            )));
+        }
+
+        let passport_json = serde_json::to_string(passport)?;
+        let updated = transaction.execute(
+            "UPDATE passports
+                SET generated_at_ms = ?1, passport_json = ?2
+              WHERE passport_id = ?3 AND run_id = ?4",
+            params![
+                passport.generated_at_ms,
+                passport_json,
+                &passport.passport_id,
+                run_id,
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StorageError::InvalidValue(format!(
+                "passport {} was not found while finishing run {run_id}",
+                passport.passport_id
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    });
+
+    if let Err(error) = result {
+        if is_storage_full(&error) {
+            if let Err(fallback_error) =
+                mark_run_failed_without_passport(connection, run_id, ended_at_ms)
+            {
+                return Err(StorageError::InvalidValue(format!(
+                    "storage ran out of space while finalizing run {run_id}; the final Passport was not saved, and the status-only fallback also failed, so the run may remain running: {fallback_error}; original error: {error}"
+                )));
+            }
+            if let Some(path) = connection_path(connection) {
+                ensure_storage_reserve(&path);
+            }
+            return Err(StorageError::InvalidValue(format!(
+                "storage ran out of space while finalizing run {run_id}; the run was marked failed, but its final Runtime Passport was not updated: {error}"
+            )));
+        }
+        return Err(error);
+    }
+    if let Some(path) = connection_path(connection) {
+        ensure_storage_reserve(&path);
+    }
+    Ok(())
+}
+
+fn mark_run_failed_without_passport(
+    connection: &mut Connection,
+    run_id: &str,
+    ended_at_ms: i64,
+) -> Result<(), StorageError> {
     let transaction = connection.transaction()?;
-
     let updated = transaction.execute(
-        "UPDATE runs SET ended_at_ms = ?1, status = ?2 WHERE run_id = ?3",
-        params![ended_at_ms, status, run_id],
+        "UPDATE runs SET ended_at_ms = ?1, status = 'failed' WHERE run_id = ?2",
+        params![ended_at_ms, run_id],
     )?;
-
     if updated != 1 {
         return Err(StorageError::InvalidValue(format!(
-            "run {run_id} was not found while finishing the run"
+            "run {run_id} could not be marked failed after storage exhaustion"
         )));
     }
-
-    let passport_json = serde_json::to_string(passport)?;
-    let updated = transaction.execute(
-        "UPDATE passports
-            SET generated_at_ms = ?1, passport_json = ?2
-          WHERE passport_id = ?3 AND run_id = ?4",
-        params![
-            passport.generated_at_ms,
-            passport_json,
-            &passport.passport_id,
-            run_id,
-        ],
-    )?;
-
-    if updated != 1 {
-        return Err(StorageError::InvalidValue(format!(
-            "passport {} was not found while finishing run {run_id}",
-            passport.passport_id
-        )));
-    }
-
     transaction.commit()?;
     Ok(())
 }
@@ -342,43 +683,47 @@ pub fn save_snapshot_and_passport(
     snapshot: &RuntimeSnapshot,
     passport: &RuntimePassport,
 ) -> Result<(), StorageError> {
-    let transaction = connection.transaction()?;
+    with_storage_space_recovery(connection, |connection, retry_after_full| {
+        if retry_after_full {
+            cleanup_storage_pressure(connection, &snapshot.snapshot_id)?;
+        }
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &snapshot.snapshot_id,
+                &snapshot.application,
+                snapshot.started_at_ms,
+                snapshot.ended_at_ms,
+                &snapshot.schema_version,
+                if snapshot.ended_at_ms.is_some() {
+                    "completed"
+                } else {
+                    "running"
+                },
+            ],
+        )?;
 
-    transaction.execute(
-        "INSERT INTO runs (run_id, application, started_at_ms, ended_at_ms, schema_version, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            &snapshot.snapshot_id,
-            &snapshot.application,
-            snapshot.started_at_ms,
-            snapshot.ended_at_ms,
-            &snapshot.schema_version,
-            if snapshot.ended_at_ms.is_some() {
-                "completed"
-            } else {
-                "running"
-            },
-        ],
-    )?;
+        for event in &snapshot.events {
+            insert_event(&transaction, &snapshot.snapshot_id, event)?;
+        }
 
-    for event in &snapshot.events {
-        insert_event(&transaction, &snapshot.snapshot_id, event)?;
-    }
-
-    let passport_json = serde_json::to_string(passport)?;
-    transaction.execute(
-        "INSERT INTO passports (passport_id, run_id, generated_at_ms, passport_json)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            &passport.passport_id,
-            &snapshot.snapshot_id,
-            passport.generated_at_ms,
-            passport_json,
-        ],
-    )?;
-
-    transaction.commit()?;
-    Ok(())
+        let passport_json = serde_json::to_string(passport)?;
+        transaction.execute(
+            "INSERT INTO passports (passport_id, run_id, generated_at_ms, passport_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &passport.passport_id,
+                &snapshot.snapshot_id,
+                passport.generated_at_ms,
+                passport_json,
+            ],
+        )?;
+        prune_runs(&transaction, configured_max_runs()?, &snapshot.snapshot_id, 0)?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 fn insert_event(
@@ -422,8 +767,10 @@ fn insert_event(
     Ok(())
 }
 
+/// Reads run metadata, its Passport, and its events from one SQLite snapshot.
 pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun>, StorageError> {
-    let run = connection
+    let transaction = connection.unchecked_transaction()?;
+    let run = transaction
         .query_row(
             "SELECT run_id, application, started_at_ms, ended_at_ms, schema_version, status FROM runs WHERE run_id = ?1",
             params![run_id],
@@ -442,17 +789,18 @@ pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun
 
     let Some((run_id, application, started_at_ms, ended_at_ms, schema_version, status)) = run
     else {
+        transaction.commit()?;
         return Ok(None);
     };
 
-    let passport_json: String = connection.query_row(
+    let passport_json: String = transaction.query_row(
         "SELECT passport_json FROM passports WHERE run_id = ?1 ORDER BY generated_at_ms DESC LIMIT 1",
         params![run_id],
         |row| row.get(0),
     )?;
     let passport: RuntimePassport = serde_json::from_str(&passport_json)?;
 
-    let mut statement = connection.prepare(
+    let mut statement = transaction.prepare(
         "SELECT event_id, timestamp_ms, event_type, pid, executable, subject, target, metadata_json, source, sensitivity FROM events WHERE run_id = ?1 ORDER BY timestamp_ms ASC, event_id ASC",
     )?;
 
@@ -475,6 +823,8 @@ pub fn get_run(connection: &Connection, run_id: &str) -> Result<Option<StoredRun
     for row in rows {
         events.push(row?);
     }
+    drop(statement);
+    transaction.commit()?;
 
     Ok(Some(StoredRun {
         run_id,
@@ -533,38 +883,43 @@ pub fn save_baseline(
     }
 
     let name_key = baseline_name_key(&baseline.name);
-    let transaction = connection.transaction()?;
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM baselines WHERE name_key = ?1)",
-        params![&name_key],
-        |row| row.get(0),
-    )?;
-    if exists {
-        return Err(StorageError::InvalidValue(format!(
-            "baseline '{}' already exists; existing baselines are not overwritten",
-            baseline.name
-        )));
-    }
+    with_storage_space_recovery(connection, |connection, retry_after_full| {
+        if retry_after_full {
+            cleanup_storage_pressure(connection, &baseline.source_run_id)?;
+        }
+        let transaction = connection.transaction()?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM baselines WHERE name_key = ?1)",
+            params![&name_key],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(StorageError::InvalidValue(format!(
+                "baseline '{}' already exists; existing baselines are not overwritten",
+                baseline.name
+            )));
+        }
 
-    transaction.execute(
-        "INSERT INTO baselines (
-            name, name_key, created_at_ms, application, source_run_id, baseline_schema_version,
-            passport_json, scope_json, coverage_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            &baseline.name,
-            &name_key,
-            baseline.created_at_ms,
-            &baseline.application,
-            &baseline.source_run_id,
-            &baseline.baseline_schema_version,
-            serde_json::to_string(&baseline.passport)?,
-            serde_json::to_string(&baseline.scope)?,
-            serde_json::to_string(&baseline.coverage)?,
-        ],
-    )?;
-    transaction.commit()?;
-    Ok(())
+        transaction.execute(
+            "INSERT INTO baselines (
+                name, name_key, created_at_ms, application, source_run_id, baseline_schema_version,
+                passport_json, scope_json, coverage_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &baseline.name,
+                &name_key,
+                baseline.created_at_ms,
+                &baseline.application,
+                &baseline.source_run_id,
+                &baseline.baseline_schema_version,
+                serde_json::to_string(&baseline.passport)?,
+                serde_json::to_string(&baseline.scope)?,
+                serde_json::to_string(&baseline.coverage)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
 }
 
 pub fn get_baseline(
@@ -730,6 +1085,271 @@ fn home_dir() -> Result<PathBuf, StorageError> {
 mod tests {
     use super::*;
     use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
+
+
+    #[test]
+    fn retention_prunes_old_runs_and_preserves_latest_and_baseline_runs() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute_batch(
+            "INSERT INTO runs VALUES
+                ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
+                ('baseline-run', 'app.exe', 200, 250, '0.1', 'completed'),
+                ('latest-completed', 'app.exe', 300, 350, '0.1', 'completed'),
+                ('latest-run', 'app.exe', 400, 450, '0.1', 'interrupted');
+             INSERT INTO events VALUES
+                ('old-event', 'old-run', 120, 'process_observed', 42, 'app.exe', 'process', 'app.exe', '{}', 'test', 'SystemMetadata');
+             INSERT INTO passports VALUES
+                ('old-passport', 'old-run', 150, '{}');
+             INSERT INTO baselines VALUES
+                ('stable', 'stable', 260, 'app.exe', 'baseline-run', '1.0', '{}', '{}', '{}');",
+        ).expect("test records should be inserted");
+
+        let transaction = connection.transaction().expect("transaction should start");
+        let deleted = prune_runs(&transaction, 2, "new-run", 1)
+            .expect("retention should succeed");
+        transaction.commit().expect("retention should commit");
+
+        assert_eq!(deleted, 1);
+        for (run_id, expected) in [
+            ("old-run", false),
+            ("baseline-run", true),
+            ("latest-completed", true),
+            ("latest-run", true),
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .expect("run existence should be readable");
+            assert_eq!(exists, expected, "unexpected retention result for {run_id}");
+        }
+        let orphan_events: i64 = connection
+            .query_row("SELECT COUNT(*) FROM events WHERE event_id = 'old-event'", [], |row| row.get(0))
+            .expect("event count should be readable");
+        let orphan_passports: i64 = connection
+            .query_row("SELECT COUNT(*) FROM passports WHERE passport_id = 'old-passport'", [], |row| row.get(0))
+            .expect("passport count should be readable");
+        assert_eq!(orphan_events, 0);
+        assert_eq!(orphan_passports, 0);
+    }
+
+    #[test]
+    fn retention_preserves_active_run_while_pruning_old_history() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute_batch(
+            "INSERT INTO runs VALUES
+                ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
+                ('latest-run', 'app.exe', 200, 250, '0.1', 'completed'),
+                ('active-run', 'app.exe', 300, NULL, '0.1', 'running');",
+        ).expect("test records should be inserted");
+
+        let transaction = connection.transaction().expect("transaction should start");
+        let deleted = prune_runs(&transaction, 1, "new-run", 1)
+            .expect("retention should succeed");
+        transaction.commit().expect("retention should commit");
+
+        assert_eq!(deleted, 1);
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("run count should be readable");
+        assert_eq!(remaining, 2);
+        let active_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'active-run')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active run should remain readable");
+        assert!(active_exists);
+    }
+
+    #[test]
+    fn retention_allows_protected_runs_to_exceed_the_configured_target() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute_batch(
+            "INSERT INTO runs VALUES
+                ('old-run', 'app.exe', 50, 75, '0.1', 'completed'),
+                ('pinned-one', 'app.exe', 100, 150, '0.1', 'completed'),
+                ('pinned-two', 'app.exe', 200, 250, '0.1', 'completed'),
+                ('active-run', 'app.exe', 300, NULL, '0.1', 'running');
+             INSERT INTO baselines VALUES
+                ('stable-one', 'stable-one', 160, 'app.exe', 'pinned-one', '1.0', '{}', '{}', '{}'),
+                ('stable-two', 'stable-two', 260, 'app.exe', 'pinned-two', '1.0', '{}', '{}', '{}');",
+        ).expect("protected runs should be inserted");
+
+        let transaction = connection.transaction().expect("transaction should start");
+        let deleted = prune_runs(&transaction, 1, "new-run", 1).expect("retention should succeed");
+        transaction.commit().expect("retention should commit");
+
+        assert_eq!(deleted, 1);
+        let old_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'old-run')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old run status should be readable");
+        let pinned_one_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'pinned-one')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("first baseline source should be readable");
+        let pinned_two_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'pinned-two')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second baseline source should be readable");
+        let active_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'active-run')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("active run status should be readable");
+        assert!(!old_exists);
+        assert!(pinned_one_exists);
+        assert!(pinned_two_exists);
+        assert!(active_exists);
+    }
+
+    #[test]
+    fn storage_pressure_cleanup_preserves_baselines_and_latest_runs() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute_batch(
+            "INSERT INTO runs VALUES
+                ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
+                ('baseline-run', 'app.exe', 200, 250, '0.1', 'completed'),
+                ('latest-completed', 'app.exe', 300, 350, '0.1', 'completed'),
+                ('active-run', 'app.exe', 400, NULL, '0.1', 'running');
+             INSERT INTO baselines VALUES
+                ('stable', 'stable', 260, 'app.exe', 'baseline-run', '1.0', '{}', '{}', '{}');",
+        ).expect("test records should be inserted");
+
+        cleanup_storage_pressure_with_limit(&mut connection, "active-run", 500)
+            .expect("storage-pressure cleanup should succeed");
+
+        for (run_id, expected) in [
+            ("old-run", false),
+            ("baseline-run", true),
+            ("latest-completed", true),
+            ("active-run", true),
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)",
+                    [run_id],
+                    |row| row.get(0),
+                )
+                .expect("run existence should be readable");
+            assert_eq!(exists, expected, "unexpected pressure cleanup for {run_id}");
+        }
+    }
+
+    #[test]
+    fn zero_run_limit_disables_emergency_history_cleanup() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection
+            .execute_batch(
+                "INSERT INTO runs VALUES
+                    ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
+                    ('latest-run', 'app.exe', 200, 250, '0.1', 'completed');",
+            )
+            .expect("test runs should be inserted");
+
+        cleanup_storage_pressure_with_limit(&mut connection, "latest-run", 0)
+            .expect("disabled emergency cleanup should be a no-op");
+        assert!(connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = 'old-run')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("old run should remain readable"));
+    }
+
+    #[test]
+    fn emergency_reserve_is_owned_and_can_be_released() {
+        let database_path = std::env::temp_dir().join(format!(
+            "tracefact-reserve-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        let reserve = reserve_path(&database_path);
+
+        ensure_storage_reserve(&database_path);
+        let size = fs::metadata(&reserve)
+            .expect("reserve file should exist")
+            .len();
+        assert!(size >= (STORAGE_RESERVE_BYTES + STORAGE_RESERVE_MARKER.len()) as u64);
+        assert!(release_storage_reserve(&database_path));
+        assert!(!reserve.exists());
+    }
+
+    #[test]
+    fn failed_storage_retry_keeps_the_storage_full_error_class() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch("CREATE TABLE pressure (payload BLOB NOT NULL);")
+            .expect("pressure table should be created");
+        let page_count: i64 = connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))
+            .expect("page count should be readable");
+        connection
+            .pragma_update(None, "max_page_count", page_count)
+            .expect("page limit should be set to the current size");
+
+        let error = with_storage_space_recovery(&mut connection, |connection, retry| {
+            if retry {
+                return Err(StorageError::InvalidValue("retry blocked".to_string()));
+            }
+            connection.execute(
+                "INSERT INTO pressure (payload) VALUES (?1)",
+                params![vec![0_u8; 32 * 1024]],
+            )?;
+            Ok(())
+        })
+        .expect_err("the retry should report its error");
+
+        assert!(is_storage_full(&error));
+        assert!(error.to_string().contains("retry blocked"));
+    }
+
+    #[test]
+    fn emergency_finalization_marks_run_failed_without_replacing_old_passport() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        connection.execute(
+            "INSERT INTO runs VALUES ('reserve-fallback', 'app.exe', 100, NULL, '0.1', 'running')",
+            [],
+        ).expect("run should be inserted");
+        connection.execute(
+            "INSERT INTO passports VALUES ('reserve-fallback-passport', 'reserve-fallback', 100, '{\"state\":\"initial\"}')",
+            [],
+        ).expect("initial passport should be inserted");
+
+        mark_run_failed_without_passport(&mut connection, "reserve-fallback", 200)
+            .expect("run should be marked failed");
+        let status: String = connection.query_row(
+            "SELECT status FROM runs WHERE run_id = 'reserve-fallback'",
+            [],
+            |row| row.get(0),
+        ).expect("status should be readable");
+        let passport_json: String = connection.query_row(
+            "SELECT passport_json FROM passports WHERE run_id = 'reserve-fallback'",
+            [],
+            |row| row.get(0),
+        ).expect("passport should be readable");
+        assert_eq!(status, "failed");
+        assert_eq!(passport_json, r#"{"state":"initial"}"#);
+    }
 
     #[test]
     fn initialize_applies_versioned_schema_migration() {
@@ -941,6 +1561,25 @@ mod tests {
         assert_eq!(stored.passport.passport_id, "passport-snap-inspect");
         assert_eq!(stored.events.len(), 1);
         assert_eq!(stored.events[0].event_id, "event-inspect");
+    }
+
+    #[test]
+    fn missing_run_lookup_closes_its_read_transaction() {
+        let mut connection = initialize(":memory:").expect("database should initialize");
+        assert!(get_run(&connection, "missing-run")
+            .expect("missing run lookup should succeed")
+            .is_none());
+
+        let transaction = connection
+            .transaction()
+            .expect("a new transaction should start after the lookup");
+        transaction
+            .execute(
+                "INSERT INTO runs VALUES ('after-missing-lookup', 'app.exe', 100, 150, '0.1', 'completed')",
+                [],
+            )
+            .expect("run should be inserted after lookup");
+        transaction.commit().expect("transaction should commit");
     }
 
     #[test]
@@ -1263,15 +1902,15 @@ mod tests {
 
         // SQLite NOCASE does not fold non-ASCII letters; the stored key must.
         let mut unicode_baseline = baseline.clone();
-        unicode_baseline.name = "CAFÉ desktop".to_string();
+        unicode_baseline.name = "CAF\u{00C9} desktop".to_string();
         save_baseline(&mut connection, &unicode_baseline)
             .expect("Unicode baseline name should save");
-        let retrieved = get_baseline(&connection, "café desktop")
+        let retrieved = get_baseline(&connection, "caf\u{00E9} desktop")
             .expect("Unicode baseline lookup should work")
             .expect("Unicode baseline should be found ignoring case");
-        assert_eq!(retrieved.name, "CAFÉ desktop");
+        assert_eq!(retrieved.name, "CAF\u{00C9} desktop");
 
-        unicode_baseline.name = "café desktop".to_string();
+        unicode_baseline.name = "caf\u{00E9} desktop".to_string();
         let error = save_baseline(&mut connection, &unicode_baseline)
             .expect_err("Unicode case variants must not create duplicates");
         assert!(error.to_string().contains("already exists"));

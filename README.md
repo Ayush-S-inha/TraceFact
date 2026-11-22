@@ -62,9 +62,29 @@ TraceFact is designed to keep its data on the user's machine. It does not need a
 
 Sensitive values should be filtered at collection time rather than being saved and cleaned up later. An exported evidence file can include process IDs, executable names, and network endpoints; review it before sharing. Missing events are not evidence that a behavior did not occur.
 
+## SQLite storage limits
+
+TraceFact applies two configurable safeguards to its local SQLite database:
+
+* It retains up to 500 runs by default. When a new run is saved, the oldest eligible runs are deleted with their events and Passports.
+* SQLite limits the main database file to 1 GiB by default. The page limit does not cap rollback-journal, WAL, or shared-memory sidecar files; `tracefact doctor` includes existing sidecars in its disk-usage figure.
+
+These are starting defaults, not workload guarantees. Measure a representative observation period with `tracefact doctor` and adjust the limits to match the applications and event rates you actually monitor.
+
+Retention never deletes an active run, a run referenced by a named baseline, the latest run, or the latest completed run. Cleanup runs in a transaction and may remove eligible completed history while another run is active; it never deletes that active run. Run reads load the run, Passport, and events within one read transaction. Connections wait up to five seconds after an `SQLITE_BUSY` result before returning a lock error; if a cleanup still cannot commit, its transaction rolls back rather than leaving a partial deletion. If protected runs alone exceed the configured run target, TraceFact keeps them all and reports the actual count in `tracefact doctor`. Saved baselines are never removed by automatic retention. Save a named baseline for any completed run that must remain available as a comparison source.
+
+Configure the limits with environment variables before starting TraceFact:
+
+* `TRACEFACT_MAX_RUNS` changes the retained-run target. Set it to `0` to disable automatic run cleanup.
+* `TRACEFACT_MAX_DATABASE_MB` changes the SQLite page limit in MiB. Set it to `0` to disable the page limit.
+
+`tracefact doctor` reports total database and sidecar usage, the effective main-database page limit, the retained-run target, protected-run count, and emergency reserve size. If an existing database already exceeds a newly configured limit, SQLite cannot lower the effective cap below its current page count. Deleting old runs frees pages for reuse; it does not shrink the database file automatically.
+
+When SQLite returns `SQLITE_FULL`, TraceFact releases its 1 MiB emergency reserve, removes eligible unpinned history one complete run per transaction, and retries the failed write once. Per-run transactions bound cleanup journal work and prevent a failed delete from leaving a partially removed run. Emergency cleanup can remove history even when the run count is below its normal target, but it never removes active runs, baseline sources, the latest run, or the latest completed run. Set `TRACEFACT_MAX_RUNS=0` to disable both normal and emergency automatic cleanup. The `SQLITE_FULL` error can mean either that the filesystem is full or that the configured SQLite page limit has been reached; releasing the reserve does not override that page limit. If a run's final Passport still cannot be stored, TraceFact makes a final attempt to mark the run `failed` without replacing its previous Passport. If the database cannot accept even that update, the run may remain `running` and needs manual recovery.
+
 ## Resource use
 
-TraceFact is meant to stay running without getting in the way. The collector design is event driven and storage is bounded.
+TraceFact is meant to stay running without getting in the way. The collectors use bounded queues and inventories, and SQLite now has configurable retention and a page limit.
 
 The starting targets are roughly:
 

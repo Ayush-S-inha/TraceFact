@@ -1508,6 +1508,42 @@ fn main() -> ExitCode {
             println!("  Payload capture: disabled");
             println!("  Telemetry:       disabled");
             println!("  AI:              optional / not required");
+            match storage::open_default() {
+                Ok((connection, database_path)) => {
+                    match storage::storage_status(&connection, &database_path) {
+                        Ok(status) => {
+                            let mib = 1024.0 * 1024.0;
+                            println!(
+                                "  SQLite files:    {:.1} MiB",
+                                status.database_bytes as f64 / mib
+                            );
+                            match status.database_limit_bytes {
+                                Some(limit) => {
+                                    println!("  Main DB limit:   {:.1} MiB", limit as f64 / mib)
+                                }
+                                None => println!("  Main DB limit:   disabled"),
+                            }
+                            if status.max_runs == 0 {
+                                println!("  Run retention:   disabled");
+                            } else {
+                                println!("  Run retention:   {} runs", status.max_runs);
+                            }
+                            println!(
+                                "  Runs stored:     {} ({} protected)",
+                                status.run_count,
+                                status.protected_run_count
+                            );
+                            println!(
+                                "  Space reserve:   {} bytes",
+                                status.emergency_reserve_bytes
+                            );
+                            println!("  Database path:   {}", database_path.display());
+                        }
+                        Err(error) => println!("  Storage status:  unavailable ({error})"),
+                    }
+                }
+                Err(error) => println!("  Storage status:  unavailable ({error})"),
+            }
             ExitCode::SUCCESS
         }
         Some("demo") if args.is_empty() => {
