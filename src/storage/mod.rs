@@ -301,9 +301,10 @@ fn prune_runs(
     let max_runs = i64::try_from(max_runs).map_err(|_| {
         StorageError::InvalidValue("TRACEFACT_MAX_RUNS exceeds the supported range".to_string())
     })?;
-    let run_count: i64 = transaction.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
-    let projected_count = run_count
-        .saturating_add(i64::try_from(additional_runs).unwrap_or(i64::MAX));
+    let run_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+    let projected_count =
+        run_count.saturating_add(i64::try_from(additional_runs).unwrap_or(i64::MAX));
     let excess = projected_count.saturating_sub(max_runs);
     if excess == 0 {
         return Ok(0);
@@ -344,11 +345,7 @@ fn cleanup_storage_pressure(
     connection: &mut Connection,
     protected_run_id: &str,
 ) -> Result<(), StorageError> {
-    cleanup_storage_pressure_with_limit(
-        connection,
-        protected_run_id,
-        configured_max_runs()?,
-    )
+    cleanup_storage_pressure_with_limit(connection, protected_run_id, configured_max_runs()?)
 }
 
 fn cleanup_storage_pressure_with_limit(
@@ -417,7 +414,8 @@ pub fn storage_status(
     Ok(StorageStatus {
         database_bytes,
         database_limit_bytes: (max_database_mb > 0).then(|| {
-            u64::try_from(page_size).unwrap_or(4096)
+            u64::try_from(page_size)
+                .unwrap_or(4096)
                 .saturating_mul(u64::try_from(max_pages).unwrap_or(0))
         }),
         emergency_reserve_bytes,
@@ -554,7 +552,12 @@ pub fn begin_run_with_events(
         for event in initial_events {
             insert_event(&transaction, &snapshot.snapshot_id, event)?;
         }
-        prune_runs(&transaction, configured_max_runs()?, &snapshot.snapshot_id, 0)?;
+        prune_runs(
+            &transaction,
+            configured_max_runs()?,
+            &snapshot.snapshot_id,
+            0,
+        )?;
         transaction.commit()?;
         Ok(())
     })
@@ -720,7 +723,12 @@ pub fn save_snapshot_and_passport(
                 passport_json,
             ],
         )?;
-        prune_runs(&transaction, configured_max_runs()?, &snapshot.snapshot_id, 0)?;
+        prune_runs(
+            &transaction,
+            configured_max_runs()?,
+            &snapshot.snapshot_id,
+            0,
+        )?;
         transaction.commit()?;
         Ok(())
     })
@@ -1086,7 +1094,6 @@ mod tests {
     use super::*;
     use crate::model::{EventType, ProcessIdentity, RuntimeEvent, Sensitivity};
 
-
     #[test]
     fn retention_prunes_old_runs_and_preserves_latest_and_baseline_runs() {
         let mut connection = initialize(":memory:").expect("database should initialize");
@@ -1105,8 +1112,7 @@ mod tests {
         ).expect("test records should be inserted");
 
         let transaction = connection.transaction().expect("transaction should start");
-        let deleted = prune_runs(&transaction, 2, "new-run", 1)
-            .expect("retention should succeed");
+        let deleted = prune_runs(&transaction, 2, "new-run", 1).expect("retention should succeed");
         transaction.commit().expect("retention should commit");
 
         assert_eq!(deleted, 1);
@@ -1126,10 +1132,18 @@ mod tests {
             assert_eq!(exists, expected, "unexpected retention result for {run_id}");
         }
         let orphan_events: i64 = connection
-            .query_row("SELECT COUNT(*) FROM events WHERE event_id = 'old-event'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = 'old-event'",
+                [],
+                |row| row.get(0),
+            )
             .expect("event count should be readable");
         let orphan_passports: i64 = connection
-            .query_row("SELECT COUNT(*) FROM passports WHERE passport_id = 'old-passport'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM passports WHERE passport_id = 'old-passport'",
+                [],
+                |row| row.get(0),
+            )
             .expect("passport count should be readable");
         assert_eq!(orphan_events, 0);
         assert_eq!(orphan_passports, 0);
@@ -1138,16 +1152,17 @@ mod tests {
     #[test]
     fn retention_preserves_active_run_while_pruning_old_history() {
         let mut connection = initialize(":memory:").expect("database should initialize");
-        connection.execute_batch(
-            "INSERT INTO runs VALUES
+        connection
+            .execute_batch(
+                "INSERT INTO runs VALUES
                 ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
                 ('latest-run', 'app.exe', 200, 250, '0.1', 'completed'),
                 ('active-run', 'app.exe', 300, NULL, '0.1', 'running');",
-        ).expect("test records should be inserted");
+            )
+            .expect("test records should be inserted");
 
         let transaction = connection.transaction().expect("transaction should start");
-        let deleted = prune_runs(&transaction, 1, "new-run", 1)
-            .expect("retention should succeed");
+        let deleted = prune_runs(&transaction, 1, "new-run", 1).expect("retention should succeed");
         transaction.commit().expect("retention should commit");
 
         assert_eq!(deleted, 1);
@@ -1221,15 +1236,17 @@ mod tests {
     #[test]
     fn storage_pressure_cleanup_preserves_baselines_and_latest_runs() {
         let mut connection = initialize(":memory:").expect("database should initialize");
-        connection.execute_batch(
-            "INSERT INTO runs VALUES
+        connection
+            .execute_batch(
+                "INSERT INTO runs VALUES
                 ('old-run', 'app.exe', 100, 150, '0.1', 'completed'),
                 ('baseline-run', 'app.exe', 200, 250, '0.1', 'completed'),
                 ('latest-completed', 'app.exe', 300, 350, '0.1', 'completed'),
                 ('active-run', 'app.exe', 400, NULL, '0.1', 'running');
              INSERT INTO baselines VALUES
                 ('stable', 'stable', 260, 'app.exe', 'baseline-run', '1.0', '{}', '{}', '{}');",
-        ).expect("test records should be inserted");
+            )
+            .expect("test records should be inserted");
 
         cleanup_storage_pressure_with_limit(&mut connection, "active-run", 500)
             .expect("storage-pressure cleanup should succeed");
@@ -1337,16 +1354,20 @@ mod tests {
 
         mark_run_failed_without_passport(&mut connection, "reserve-fallback", 200)
             .expect("run should be marked failed");
-        let status: String = connection.query_row(
-            "SELECT status FROM runs WHERE run_id = 'reserve-fallback'",
-            [],
-            |row| row.get(0),
-        ).expect("status should be readable");
-        let passport_json: String = connection.query_row(
-            "SELECT passport_json FROM passports WHERE run_id = 'reserve-fallback'",
-            [],
-            |row| row.get(0),
-        ).expect("passport should be readable");
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM runs WHERE run_id = 'reserve-fallback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("status should be readable");
+        let passport_json: String = connection
+            .query_row(
+                "SELECT passport_json FROM passports WHERE run_id = 'reserve-fallback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("passport should be readable");
         assert_eq!(status, "failed");
         assert_eq!(passport_json, r#"{"state":"initial"}"#);
     }

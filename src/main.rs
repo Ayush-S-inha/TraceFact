@@ -1530,8 +1530,7 @@ fn main() -> ExitCode {
                             }
                             println!(
                                 "  Runs stored:     {} ({} protected)",
-                                status.run_count,
-                                status.protected_run_count
+                                status.run_count, status.protected_run_count
                             );
                             println!(
                                 "  Space reserve:   {} bytes",
