@@ -474,6 +474,13 @@ fn run_compare(baseline_name: &str, run_id: &str, report_path: Option<&str>) -> 
     let current_run = storage::get_run(&connection, &resolved_run_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Run {resolved_run_id} was not found."))?;
+    if current_run.run_id == baseline.source_run_id {
+        return Err(format!(
+            "Run '{}' is the source of baseline '{}'. Capture a later run before comparing.",
+            current_run.run_id, baseline.name
+        ));
+    }
+
     let report = analysis::compare_baseline_to_run(
         &baseline,
         &baseline_run,

@@ -9,6 +9,7 @@ pub enum EventType {
     ProcessExit,
     ProcessObserved,
     NetworkConnection,
+    NetworkWatchSummary,
     FileAccess,
     FileChange,
     FileObserved,

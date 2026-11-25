@@ -5,7 +5,7 @@ pub(super) fn print_help() {
     println!("  tracefact doctor");
     println!("  tracefact demo");
     println!("  tracefact process <pid>");
-    println!("  tracefact watch <pid>");
+    println!("  tracefact watch <pid> [--duration <seconds>]");
     println!("  tracefact watch-files <directory> [duration_seconds]");
     println!("    Quote directory paths that contain spaces.");
     println!("  tracefact history");

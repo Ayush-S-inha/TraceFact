@@ -31,6 +31,7 @@ impl PassportAccumulator {
                     self.network_targets.insert(target.clone());
                 }
             }
+            EventType::NetworkWatchSummary => {}
             EventType::FileAccess | EventType::FileObserved => {
                 if let Some(target) = &event.target {
                     self.files.insert(target.clone());
@@ -264,10 +265,10 @@ pub fn evidence_bundle_from_run(
 
     if is_watch {
         match process_watch_loss_counts(run) {
-            Some((0, 0, 0)) => {}
-            Some((dropped_starts, dropped_exits, unpersisted)) => {
+            Some((0, 0, 0, 0)) => {}
+            Some((dropped_starts, dropped_exits, unpersisted, unclassified)) => {
                 limitations.push(format!(
-                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, and {unpersisted} queued or failed event records; process-set comparison is skipped."
+                    "The process watch did not persist {dropped_starts} start-event records, {dropped_exits} exit-event records, {unpersisted} queued or failed event records, and {unclassified} events that could not be reconciled; process-set comparison is skipped."
                 ));
             }
             None => limitations.push(
@@ -275,6 +276,15 @@ pub fn evidence_bundle_from_run(
                     .to_string(),
             ),
         }
+
+        if !network_watch_coverage_complete(run) {
+            limitations.push(
+                "The network observer has no valid complete coverage summary, or it reported dropped, undecodable, unattributed, or unpersisted observations; network-target comparison is skipped.".to_string(),
+            );
+        }
+        limitations.push(
+            "A complete observer summary covers TraceFact's visible queues and persistence accounting; it does not prove Windows or ETW delivered every event that could have matched the selected process tree.".to_string(),
+        );
     }
 
     if is_filesystem_watch {
@@ -659,7 +669,9 @@ pub fn compare_baseline_to_run(
         let network_comparable = baseline.scope.kind == "selected_process_tree_watch"
             && current_scope.kind == "selected_process_tree_watch"
             && baseline_sources.contains("windows_network_watch")
-            && current_sources.contains("windows_network_watch");
+            && current_sources.contains("windows_network_watch")
+            && network_watch_coverage_complete(baseline_run)
+            && network_watch_coverage_complete(current_run);
         compare_observation_category(
             &mut findings,
             &mut compared_categories,
@@ -862,7 +874,7 @@ fn has_process_provenance(sources: &[String]) -> bool {
         .any(|source| source == "windows_process" || source == "windows_process_watch")
 }
 
-fn process_watch_loss_counts(run: &StoredRun) -> Option<(u64, u64, u64)> {
+fn process_watch_loss_counts(run: &StoredRun) -> Option<(u64, u64, u64, u64)> {
     let mut summaries = run.events.iter().filter(|event| {
         event.source == "windows_process_watch" && event.subject.as_deref() == Some("watch_summary")
     });
@@ -876,11 +888,33 @@ fn process_watch_loss_counts(run: &StoredRun) -> Option<(u64, u64, u64)> {
         metadata.get("dropped_start_events")?.as_u64()?,
         metadata.get("dropped_exit_events")?.as_u64()?,
         metadata.get("unpersisted_events_at_stop")?.as_u64()?,
+        metadata.get("unclassified_events")?.as_u64()?,
     ))
 }
 
 fn process_watch_coverage_complete(run: &StoredRun) -> bool {
-    process_watch_loss_counts(run) == Some((0, 0, 0))
+    process_watch_loss_counts(run) == Some((0, 0, 0, 0))
+}
+
+fn network_watch_coverage_complete(run: &StoredRun) -> bool {
+    let mut summaries = run.events.iter().filter(|event| {
+        event.source == "windows_network_watch"
+            && event.event_type == "network_watch_summary"
+            && event.subject.as_deref() == Some("watch_summary")
+    });
+    let Some(summary) = summaries.next() else {
+        return false;
+    };
+    if summaries.next().is_some() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&summary.metadata_json) else {
+        return false;
+    };
+    metadata
+        .get("coverage_complete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 fn compare_observation_category(

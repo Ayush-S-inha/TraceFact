@@ -558,6 +558,7 @@ pub fn build_process_watch_summary_event(
     timestamp_ms: i64,
     dropped: ProcessEventDropCounts,
     unpersisted_events_at_stop: usize,
+    unclassified_events: usize,
 ) -> RuntimeEvent {
     RuntimeEvent {
         id: format!("{run_id}-event-{sequence}"),
@@ -577,6 +578,7 @@ pub fn build_process_watch_summary_event(
             "dropped_start_events": dropped.start_events,
             "dropped_exit_events": dropped.exit_events,
             "unpersisted_events_at_stop": unpersisted_events_at_stop,
+            "unclassified_events": unclassified_events,
             "queue_capacity": PROCESS_EVENT_QUEUE_CAPACITY
         }),
         source: "windows_process_watch".to_string(),
@@ -958,12 +960,14 @@ mod tests {
                 exit_events: 2,
             },
             4,
+            3,
         );
 
         assert_eq!(event.subject, "watch_summary");
         assert_eq!(event.metadata["dropped_start_events"], 3);
         assert_eq!(event.metadata["dropped_exit_events"], 2);
         assert_eq!(event.metadata["unpersisted_events_at_stop"], 4);
+        assert_eq!(event.metadata["unclassified_events"], 3);
     }
 
     #[test]

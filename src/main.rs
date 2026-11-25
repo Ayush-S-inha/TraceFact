@@ -461,7 +461,7 @@ fn drain_network_queue(
 }
 
 #[cfg(windows)]
-fn run_watch(pid: u32) -> Result<(), String> {
+fn run_watch(pid: u32, duration_seconds: Option<u64>) -> Result<(), String> {
     use collectors::windows_network::WindowsNetworkEventWatcher;
     use collectors::windows_process::{
         build_process_exit_event, build_process_lifecycle_event, build_process_watch_summary_event,
@@ -572,10 +572,19 @@ fn run_watch(pid: u32) -> Result<(), String> {
     println!("  Database:        {}", database_path.display());
     println!("  Run ID:          {run_id}");
     println!();
-    println!("Watching process starts, exits, and TCP connection metadata. Press Ctrl+C to stop.");
+    match duration_seconds {
+        Some(seconds) => println!(
+            "Watching process starts, exits, and TCP connection metadata for {seconds} seconds."
+        ),
+        None => println!(
+            "Watching process starts, exits, and TCP connection metadata. Press Ctrl+C to stop."
+        ),
+    }
+    let watch_started = Instant::now();
 
     let mut process_event_queue_stopped = false;
     let mut process_events_persistence_failures = 0_usize;
+    let mut process_events_unclassified = 0_usize;
     let mut stop_reason: Option<&'static str> = None;
     let mut network_error = None;
 
@@ -583,6 +592,13 @@ fn run_watch(pid: u32) -> Result<(), String> {
         let network_receiver = network_watcher.receiver();
 
         'watch: loop {
+            if duration_seconds
+                .is_some_and(|seconds| watch_started.elapsed() >= Duration::from_secs(seconds))
+            {
+                stop_reason = Some("duration elapsed");
+                stop_requested.store(true, Ordering::SeqCst);
+            }
+
             loop {
                 match control_receiver.try_recv() {
                     Ok(ProcessWatchControl::Ready(_)) => {}
@@ -661,10 +677,12 @@ fn run_watch(pid: u32) -> Result<(), String> {
                         });
 
                     let Some(depth) = depth else {
+                        process_events_unclassified = process_events_unclassified.saturating_add(1);
                         continue 'watch;
                     };
 
                     if active.contains_key(&event.process_id) {
+                        process_events_unclassified = process_events_unclassified.saturating_add(1);
                         continue 'watch;
                     }
 
@@ -705,6 +723,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
                 }
                 ProcessWatchEvent::Exit(event) => {
                     let Some(previous) = active.get(&event.process_id).cloned() else {
+                        process_events_unclassified = process_events_unclassified.saturating_add(1);
                         continue 'watch;
                     };
 
@@ -712,6 +731,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
                     // may differ from the initial snapshot or be unavailable,
                     // particularly for the root process.
                     if previous.name != event.process_name {
+                        process_events_unclassified = process_events_unclassified.saturating_add(1);
                         continue 'watch;
                     }
 
@@ -821,6 +841,57 @@ fn run_watch(pid: u32) -> Result<(), String> {
 
     let stop_reason = stop_reason.unwrap_or("stopped by user");
     let ended_at_ms = current_unix_ms()?;
+    let queue_dropped_events = network_watcher.dropped_events();
+    let network_events_accounted = network_events_saved
+        .saturating_add(network_events_filtered)
+        .saturating_add(network_attribution_failures);
+    let network_coverage_complete = queue_dropped_events == 0
+        && network_diagnostics.incomplete_tcp_events == 0
+        && network_attribution_failures == 0
+        && network_events_accounted == network_diagnostics.observations_enqueued
+        && network_error.is_none();
+    let network_summary_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| "Network event sequence exhausted.".to_string())?;
+    let network_summary = model::RuntimeEvent {
+        id: run_event_id(&run_id, network_summary_sequence),
+        timestamp_ms: ended_at_ms,
+        event_type: model::EventType::NetworkWatchSummary,
+        process: model::ProcessIdentity {
+            pid,
+            executable: application.clone(),
+            command_line: None,
+            parent_pid: None,
+        },
+        subject: "watch_summary".to_string(),
+        target: None,
+        metadata: serde_json::json!({
+            "root_pid": pid,
+            "raw_events_seen": network_diagnostics.raw_events_seen,
+            "tcp_events_decoded": network_diagnostics.tcp_events_decoded,
+            "other_events_decoded": network_diagnostics.other_events_decoded,
+            "unsupported_tcp_operations": network_diagnostics.unsupported_tcp_operations,
+            "incomplete_tcp_events": network_diagnostics.incomplete_tcp_events,
+            "observations_enqueued": network_diagnostics.observations_enqueued,
+            "events_saved": network_events_saved,
+            "events_filtered_outside_process_tree": network_events_filtered,
+            "events_with_unverified_attribution": network_attribution_failures,
+            "queue_dropped_events": queue_dropped_events,
+            "stream_error_present": network_error.is_some(),
+            "coverage_basis": "TraceFact queue and persistence accounting; not a guarantee of complete OS-level event delivery",
+            "coverage_complete": network_coverage_complete
+        }),
+        source: "windows_network_watch".to_string(),
+        sensitivity: model::Sensitivity::SystemMetadata,
+    };
+    if let Err(error) = storage::append_event(&mut connection, &run_id, &network_summary) {
+        if network_error.is_none() {
+            network_error = Some(format!("Could not save network coverage summary: {error}"));
+        }
+    } else {
+        sequence = network_summary_sequence;
+    }
+
     let summary_sequence = sequence
         .checked_add(1)
         .ok_or_else(|| "Process event sequence exhausted.".to_string())?;
@@ -831,6 +902,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
         ended_at_ms,
         process_event_drops,
         process_events_not_persisted_at_stop,
+        process_events_unclassified,
     );
     if let Err(error) = storage::append_event(&mut connection, &run_id, &process_summary) {
         if network_error.is_none() {
@@ -842,7 +914,7 @@ fn run_watch(pid: u32) -> Result<(), String> {
 
     let terminal_status = if network_error.is_some() {
         "failed"
-    } else if stop_reason == "root process exited" {
+    } else if stop_reason == "root process exited" || stop_reason == "duration elapsed" {
         "completed"
     } else {
         "interrupted"
@@ -983,6 +1055,16 @@ fn new_run_identity(prefix: &str, owner_pid: Option<u32>) -> Result<(i64, String
 
 fn run_event_id(run_id: &str, sequence: u64) -> String {
     format!("{run_id}-event-{sequence}")
+}
+
+fn parse_watch_args(args: &[String]) -> Result<(u32, Option<u64>), String> {
+    match args {
+        [value] => Ok((parse_pid(value)?, None)),
+        [value, flag, duration] if flag == "--duration" => {
+            Ok((parse_pid(value)?, Some(parse_duration(duration)?)))
+        }
+        _ => Err("Usage: tracefact watch <pid> [--duration <seconds>]".to_string()),
+    }
 }
 
 #[cfg(windows)]
@@ -1500,8 +1582,9 @@ fn main() -> ExitCode {
         }
         Some("doctor") if args.is_empty() => {
             println!("TraceFact doctor");
-            println!("  Core:            ready");
+            println!("  Core:            CLI initialized");
             println!("  Storage design:  SQLite");
+            let mut doctor_status = ExitCode::SUCCESS;
             println!("  Network:         TCP metadata in process watch mode");
             println!("  Filesystem:      selected directory tree watch on Windows");
             println!("  Loaded modules:  point-in-time Windows process snapshot");
@@ -1538,12 +1621,18 @@ fn main() -> ExitCode {
                             );
                             println!("  Database path:   {}", database_path.display());
                         }
-                        Err(error) => println!("  Storage status:  unavailable ({error})"),
+                        Err(error) => {
+                            doctor_status = ExitCode::FAILURE;
+                            println!("  Storage status:  unavailable ({error})");
+                        }
                     }
                 }
-                Err(error) => println!("  Storage status:  unavailable ({error})"),
+                Err(error) => {
+                    doctor_status = ExitCode::FAILURE;
+                    println!("  Storage status:  unavailable ({error})");
+                }
             }
-            ExitCode::SUCCESS
+            doctor_status
         }
         Some("demo") if args.is_empty() => {
             let passport = collectors::demo::build_demo_passport();
@@ -1558,33 +1647,27 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("watch") => match args.as_slice() {
-            [value] => match parse_pid(value) {
-                Ok(pid) => {
-                    #[cfg(windows)]
-                    {
-                        match run_watch(pid) {
-                            Ok(()) => ExitCode::SUCCESS,
-                            Err(error) => {
-                                eprintln!("TraceFact could not watch process {pid}: {error}");
-                                ExitCode::FAILURE
-                            }
+        Some("watch") => match parse_watch_args(&args) {
+            Ok((pid, duration_seconds)) => {
+                #[cfg(windows)]
+                {
+                    match run_watch(pid, duration_seconds) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("TraceFact could not watch process {pid}: {error}");
+                            ExitCode::FAILURE
                         }
                     }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = pid;
-                        eprintln!("The Windows process watcher runs only on Windows.");
-                        ExitCode::FAILURE
-                    }
                 }
-                Err(error) => {
-                    eprintln!("TraceFact could not watch process: {error}");
+                #[cfg(not(windows))]
+                {
+                    let _ = (pid, duration_seconds);
+                    eprintln!("The Windows process watcher runs only on Windows.");
                     ExitCode::FAILURE
                 }
-            },
-            _ => {
-                eprintln!("Usage: tracefact watch <pid>");
+            }
+            Err(error) => {
+                eprintln!("TraceFact could not watch process: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -1685,7 +1768,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod cli_input_tests {
-    use super::{parse_duration, parse_pid, run_event_id};
+    use super::{parse_duration, parse_pid, parse_watch_args, run_event_id};
 
     #[test]
     fn pid_must_be_a_positive_u32() {
@@ -1702,6 +1785,28 @@ mod cli_input_tests {
         assert!(parse_duration("0").is_err());
         assert!(parse_duration("-2").is_err());
         assert!(parse_duration("many").is_err());
+    }
+
+    #[test]
+    fn watch_args_accept_an_optional_positive_duration() {
+        assert_eq!(parse_watch_args(&["42".to_string()]).unwrap(), (42, None));
+        assert_eq!(
+            parse_watch_args(&[
+                "42".to_string(),
+                "--duration".to_string(),
+                "300".to_string()
+            ])
+            .unwrap(),
+            (42, Some(300))
+        );
+        assert!(
+            parse_watch_args(&["42".to_string(), "--duration".to_string(), "0".to_string()])
+                .is_err()
+        );
+        assert!(
+            parse_watch_args(&["42".to_string(), "--other".to_string(), "300".to_string()])
+                .is_err()
+        );
     }
 
     #[test]
