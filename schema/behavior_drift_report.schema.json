@@ -187,7 +187,8 @@
           "enum": [
             "processes",
             "network_targets",
-            "files"
+            "files",
+            "libraries"
           ]
         },
         "observation": {

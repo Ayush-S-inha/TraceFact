@@ -28,7 +28,7 @@ The Windows process collector is working in two modes.
 
 The process observer records process IDs, parent process IDs, process names, thread counts, and the position of each process in the selected tree. It does not collect command lines. Its WMI event queue holds up to 4,096 lifecycle events; overflow and events left queued at shutdown appear in a process-watch summary. Process-set comparison is skipped when the summary reports loss or when an older run has no summary.
 
-The watch command also includes an experimental Windows TCP observer. It records connection metadata for processes in the selected tree, including endpoint addresses and ports. It does not store network payloads. The network observer requires an Administrator PowerShell and is still being validated on Windows systems.
+The watch command also includes an experimental Windows TCP observer. It records connection metadata for processes in the selected tree, including endpoint addresses and ports. It does not store network payloads. Every finalized process-watch run now stores a network coverage summary, including queue drops, incomplete TCP records, attribution outcomes, and persistence counts. Network comparison is skipped unless the summary proves complete coverage. The network observer requires an Administrator PowerShell and is still being validated on Windows systems.
 
 Filesystem observation, runtime dependency tracking, comparison, security checks, and the interface are separate stages of the project.
 
@@ -39,6 +39,7 @@ Build the project with Cargo, then give TraceFact the PID of a running Windows p
 ```text
 tracefact process <pid>
 tracefact watch <pid>
+tracefact watch <pid> --duration 300
 tracefact history
 tracefact inspect latest
 tracefact export latest tracefact-evidence.json
@@ -50,7 +51,7 @@ tracefact compare "desktop stable" <later_completed_run_id>
 tracefact compare "desktop stable" <later_completed_run_id> comparison.json
 ```
 
-Named Runtime Passport baselines can be saved from completed runs. Baselines retain their source run, observation scope, and coverage limitations. Names are unique without regard to case; saving an existing name fails rather than replacing it. `tracefact compare <baseline_name> <run_id|latest>` compares a completed run against a baseline. Findings link to stored event IDs where possible; add a JSON path to export the report. For a meaningful comparison, capture the baseline and the later run using the same observation mode for the same application. Comparing a snapshot to a watch run produces a scope mismatch, so behavior-set findings are skipped. `latest` selects the latest completed run, which may still be the baseline's source run if you have not recorded another run. The first comparison pass covers process names and network targets when both runs have suitable provenance. Files and libraries are skipped until those collectors exist. A `not_observed` finding does not prove behavior stopped.
+Named Runtime Passport baselines can be saved from completed runs. Baselines retain their source run, observation scope, and coverage limitations. Names are unique without regard to case; saving an existing name fails rather than replacing it. `tracefact compare <baseline_name> <run_id|latest>` compares a completed run against a baseline. Findings link to stored event IDs where possible; add a JSON path to export the report. For a meaningful comparison, capture the baseline and the later run using the same observation mode for the same application. Comparing a snapshot to a watch run produces a scope mismatch, so behavior-set findings are skipped. `latest` selects the latest completed run, which may still be the baseline's source run if you have not recorded another run. The comparison pass covers process names, network targets, files, and loaded libraries only when both runs have matching scopes and complete collector coverage. Process-watch comparisons require a valid queue and reconciliation summary; network-target comparisons require a valid network coverage summary with no dropped, undecodable, unattributed, or unpersisted observations. A run cannot be compared with the baseline's own source run. A `not_observed` finding does not prove behavior stopped.
 
 The process command saves a point in time observation. The watch command keeps listening until the root process exits or you stop the run with Ctrl+C. The export command writes a standalone JSON evidence bundle for a finalized run. It refuses to overwrite an existing path. History lists saved runs and their lifecycle status (`running`, `completed`, `interrupted`, or `failed`). Inspect shows the stored events, final status, and Runtime Passport. A run stopped with Ctrl+C is marked interrupted; a run whose root process exits normally is completed; an observer or persistence error is reported as failed when the final state can be written.
 
