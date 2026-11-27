@@ -1,3 +1,5 @@
+pub mod batch;
+
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -347,7 +349,6 @@ fn cleanup_storage_pressure(
 ) -> Result<(), StorageError> {
     cleanup_storage_pressure_with_limit(connection, protected_run_id, configured_max_runs()?)
 }
-
 fn cleanup_storage_pressure_with_limit(
     connection: &mut Connection,
     protected_run_id: &str,
